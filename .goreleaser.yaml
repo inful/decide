@@ -1,0 +1,58 @@
+# goreleaser configuration for github.com/inful/decide.
+# This is a Go library, so we skip the build step (no binaries to ship) and
+# focus on tag-driven GitHub releases with a conventional-commits changelog.
+# Docs: https://goreleaser.com/customization/
+version: 2
+
+project_name: decide
+
+# Run before any other step. `go mod tidy` keeps go.mod/go.sum honest and
+# would catch a forgotten tidy in CI; the test command runs the same suite
+# the GitHub Actions CI runs, surfacing regressions at tag time.
+before:
+  hooks:
+    - go mod tidy
+    - go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+
+# No binaries — GoReleaser would error otherwise.
+builds:
+  - skip: true
+
+# Changelog is generated from git history between the last tag and HEAD.
+# Groups match the project's conventional-commits convention; anything
+# outside the listed types falls into "Others".
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - '^ci:'
+      - '^build:'
+      - '^style:'
+  groups:
+    - title: Features
+      regexp: '^feat'
+      order: 0
+    - title: 'Bug Fixes'
+      regexp: '^fix'
+      order: 1
+    - title: 'Performance Improvements'
+      regexp: '^perf'
+      order: 2
+    - title: 'Code Refactoring'
+      regexp: '^refactor'
+      order: 3
+    - title: Others
+      order: 999
+
+# Draft releases by default so the maintainer can edit notes before
+# publishing. `prerelease: auto` marks vX.Y.Z-rcN tags as prereleases.
+release:
+  github:
+    owner: inful
+    name: decide
+  draft: true
+  prerelease: auto
