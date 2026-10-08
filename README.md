@@ -241,3 +241,44 @@ go test -race -count=1 ./...
 ```
 
 Coverage runs at ~90% of statements; the package has no transitive dependencies.
+
+## Releasing
+
+The project follows [Conventional Commits][cc] for changelog generation and
+version bumping:
+
+- `feat:` triggers a minor bump
+- `fix:` triggers a patch bump
+- `feat!` or a `BREAKING CHANGE:` footer triggers a major bump
+- Other types (`ci:`, `docs:`, `refactor:`, etc.) don't trigger a bump but
+  may appear in the changelog under "Others"
+
+[cc]: https://www.conventionalcommits.org/
+
+### Cutting a release
+
+```bash
+# Decide the next version from the commits since the last tag, then:
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+Pushing the tag triggers `.github/workflows/release.yml`, which runs
+[GoReleaser][gr] and produces a draft GitHub release with a generated
+changelog. Review and publish from the GitHub UI.
+
+[gr]: https://goreleaser.com/
+
+### Local dry run
+
+```bash
+goreleaser release --snapshot --clean
+```
+
+Runs the full release pipeline locally without pushing or creating a release.
+Useful for validating `.goreleaser.yaml` changes.
+
+### CI
+
+`.github/workflows/ci.yml` runs `go mod tidy`, `go vet`, `go test -race
+-cover`, and `golangci-lint` on every push and PR to `main`.
