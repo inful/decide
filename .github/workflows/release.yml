@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    # GoReleaser ships tags that match vX.Y.Z or vX.Y.Z-rcN.
+    tags: ['v*.*.*']
+
+# Write releases: create the GitHub release. The default GITHUB_TOKEN has
+# sufficient scope for a draft release against the same repo.
+permissions:
+  contents: write
+
+# Don't run more than one release at a time for the same tag.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so GoReleaser can compute the changelog between
+          # the previous and current tags.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          # `latest` follows the goreleaser/goreleaser-action default; pin
+          # to a specific GoReleaser version if reproducibility matters.
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

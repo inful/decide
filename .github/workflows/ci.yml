@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Read-only: this workflow doesn't push, tag, or comment.
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same branch when a new push lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Use the version declared in go.mod so the CI matches the
+          # project's stated minimum; bumping go.mod bumps CI automatically.
+          go-version-file: go.mod
+          cache: true
+
+      - name: go mod tidy (check)
+        # Catches a forgotten `go mod tidy` before tests run.
+        run: |
+          go mod tidy
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "go.mod or go.sum is out of date; run 'go mod tidy' locally and commit."
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Upload coverage artifact
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Pin to the same golangci-lint major used locally. v1.x is built with
+      # an older Go and refuses to lint code targeting go1.26+. Bump the
+      # pin when bumping the local install.
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.14.0
