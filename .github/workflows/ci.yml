@@ -63,9 +63,10 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Pin to the same golangci-lint major used locally. v1.x is built with
-      # an older Go and refuses to lint code targeting go1.26+. Bump the
-      # pin when bumping the local install.
-      - uses: golangci/golangci-lint-action@v6
+      # Pin to the same golangci-lint major used locally. golangci-lint-action
+      # v6 only handles golangci-lint v1.x; for v2.x we need v7 of the action.
+      # v1.x is built with Go 1.24 and refuses to lint code targeting
+      # go1.26+. Bump the pin when bumping the local install.
+      - uses: golangci/golangci-lint-action@v7
         with:
           version: v2.14.0
