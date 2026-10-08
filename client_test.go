@@ -35,8 +35,8 @@ func TestNew_DefaultOptions(t *testing.T) {
 }
 
 func TestWithToken(t *testing.T) {
-	c := New("https://example.test", WithToken("sk-gw-xyz"))
-	if c.token != "sk-gw-xyz" {
+	c := New("https://example.test", WithToken("<TOKEN>"))
+	if c.token != "<TOKEN>" {
 		t.Errorf("token = %q", c.token)
 	}
 }
@@ -103,9 +103,9 @@ func TestClient_SystemOne_HappyPath(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c := New(srv.URL, WithToken("sk-gw-test"))
+	c := New(srv.URL, WithToken("<TOKEN>"))
 	resp, err := c.SystemOne(context.Background(), Request{
-		State: State{Body: "Jeg ble fakturert to ganger, jeg vil ha pengene tilbake."},
+		State: State{Body: "I was charged twice, I want a refund."},
 		Questions: Questions{
 			"department": NewChoice("Which?", map[string]string{"billing": "invoices"}),
 		},
@@ -117,7 +117,7 @@ func TestClient_SystemOne_HappyPath(t *testing.T) {
 	if gotMethod != http.MethodPost {
 		t.Errorf("method = %q, want POST", gotMethod)
 	}
-	if gotAuth != "Bearer sk-gw-test" {
+	if gotAuth != "Bearer <TOKEN>" {
 		t.Errorf("Authorization = %q", gotAuth)
 	}
 	if gotContentType != "application/json" {

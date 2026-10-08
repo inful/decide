@@ -19,11 +19,11 @@ Go 1.22+ is sufficient; the module declares Go 1.26.
 ```go
 client := decide.New(
     "https://api.example.com",
-    decide.WithToken("sk-gw-..."),
+    decide.WithToken("<TOKEN>"),
 )
 
 resp, err := client.SystemOne(ctx, decide.Request{
-    State: decide.State{Body: "Jeg ble fakturert to ganger, jeg vil ha pengene tilbake."},
+    State: decide.State{Body: "I was charged twice, I want a refund."},
     Questions: decide.Questions{
         "department": decide.NewChoice(
             "Which department should handle this?",
@@ -142,12 +142,12 @@ Request:
 
 ```json
 POST /v1/systemone
-Authorization: Bearer sk-gw-...
+Authorization: Bearer <TOKEN>
 Content-Type: application/json
 X-Request-ID: 81f778ef-133d-41c9-99f6-f47417675689
 
 {
-  "state": {"body": "Jeg ble fakturert to ganger, jeg vil ha pengene tilbake."},
+  "state": {"body": "I was charged twice, I want a refund."},
   "questions": {
     "department": {
       "type": "choice",

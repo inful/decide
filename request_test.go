@@ -52,7 +52,7 @@ func TestNewNoulMarshalOmitsCriteria(t *testing.T) {
 
 func TestRequestRoundTripMatchesCurlExample(t *testing.T) {
 	original := Request{
-		State: State{Body: "Jeg ble fakturert to ganger, jeg vil ha pengene tilbake."},
+		State: State{Body: "I was charged twice, I want a refund."},
 		Questions: Questions{
 			"department": NewChoice(
 				"Which department should handle this?",
@@ -81,7 +81,7 @@ func TestRequestRoundTripMatchesCurlExample(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		`"state":{"body":"Jeg ble fakturert to ganger, jeg vil ha pengene tilbake."}`,
+		`"state":{"body":"I was charged twice, I want a refund."}`,
 		`"department"`,
 		`"refund_requested"`,
 		`"type":"choice"`,
