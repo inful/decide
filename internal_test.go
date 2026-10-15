@@ -1,8 +1,11 @@
 package decide
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -167,5 +170,368 @@ func TestMarshalRoundTrip_RequestAndResponse(t *testing.T) {
 	}
 	if len(reqBack.Questions["b"].Criteria) != 0 {
 		t.Errorf("b should not have criteria")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// runWithRetry — extracted retry runner. These tests exercise the retry
+// contract in isolation (no httptest), which is the whole point of the
+// extraction: today every retry invariant is exercised only through a
+// real HTTP server, which is slow and hard to set up.
+// ---------------------------------------------------------------------------
+
+const (
+	retryTestRequestID = "test-request-id"
+	retryTestEndpoint  = "https://example.test/v1/systemone"
+)
+
+func retryTestClient(t *testing.T) *Client {
+	t.Helper()
+	c := New("https://example.test",
+		WithBackoff(1*time.Microsecond, 5*time.Microsecond),
+	)
+	return c
+}
+
+// serverError returns a synthetic retryable *Error.
+func serverError(status int) *Error {
+	return &Error{
+		StatusCode: status,
+		Status:     http.StatusText(status),
+		Method:     http.MethodPost,
+		URL:        retryTestEndpoint,
+		Body:       "boom",
+		sentinel:   ErrServerError,
+	}
+}
+
+// clientError returns a synthetic non-retryable *Error.
+func clientError(status int) *Error {
+	s := sentinelForStatus(status)
+	return &Error{
+		StatusCode: status,
+		Status:     http.StatusText(status),
+		Method:     http.MethodPost,
+		URL:        retryTestEndpoint,
+		Body:       "no",
+		sentinel:   s,
+	}
+}
+
+// transportError returns a synthetic retryable transport *Error.
+func transportError(cause error) *Error {
+	return &Error{
+		StatusCode: 0,
+		Status:     "transport error",
+		Method:     http.MethodPost,
+		URL:        retryTestEndpoint,
+		Body:       cause.Error(),
+		sentinel:   ErrTransport,
+		cause:      cause,
+	}
+}
+
+func TestRunWithRetry_SuccessOnFirstAttempt(t *testing.T) {
+	c := retryTestClient(t)
+
+	var calls int
+	res := c.runWithRetry(context.Background(), 5, retryTestRequestID, retryTestEndpoint,
+		func() attemptResult {
+			calls++
+			return attemptResult{Outcome: outcomeSuccess, Response: nil}
+		})
+
+	if calls != 1 {
+		t.Errorf("action calls = %d, want 1 (no retry needed)", calls)
+	}
+	if res.Outcome != outcomeSuccess {
+		t.Errorf("outcome = %d, want outcomeSuccess", res.Outcome)
+	}
+	if res.Err != nil {
+		t.Errorf("Err = %v, want nil on success", res.Err)
+	}
+}
+
+func TestRunWithRetry_RetriesUntilSuccess(t *testing.T) {
+	c := retryTestClient(t)
+
+	var calls int
+	res := c.runWithRetry(context.Background(), 5, retryTestRequestID, retryTestEndpoint,
+		func() attemptResult {
+			calls++
+			if calls < 3 {
+				return attemptResult{Outcome: outcomeRetry, Err: serverError(http.StatusServiceUnavailable)}
+			}
+			return attemptResult{Outcome: outcomeSuccess, Response: nil}
+		})
+
+	if calls != 3 {
+		t.Errorf("action calls = %d, want 3", calls)
+	}
+	if res.Outcome != outcomeSuccess {
+		t.Errorf("outcome = %d, want outcomeSuccess", res.Outcome)
+	}
+}
+
+func TestRunWithRetry_FatalErrorShortCircuits(t *testing.T) {
+	c := retryTestClient(t)
+
+	fatal := clientError(http.StatusBadRequest)
+	var calls int
+	res := c.runWithRetry(context.Background(), 5, retryTestRequestID, retryTestEndpoint,
+		func() attemptResult {
+			calls++
+			return attemptResult{Outcome: outcomeFatal, Err: fatal}
+		})
+
+	if calls != 1 {
+		t.Errorf("action calls = %d, want 1 (no retry on fatal)", calls)
+	}
+	if res.Err != fatal {
+		t.Errorf("Err = %v, want fatal", res.Err)
+	}
+}
+
+func TestRunWithRetry_ExhaustionReturnsLastError(t *testing.T) {
+	c := retryTestClient(t)
+
+	shared := serverError(http.StatusServiceUnavailable)
+	var calls int
+	res := c.runWithRetry(context.Background(), 3, retryTestRequestID, retryTestEndpoint,
+		func() attemptResult {
+			calls++
+			return attemptResult{Outcome: outcomeRetry, Err: shared}
+		})
+
+	if calls != 3 {
+		t.Errorf("action calls = %d, want 3 (maxAttempts)", calls)
+	}
+	if res.Err != shared {
+		t.Errorf("Err = %v, want the same instance the action returned", res.Err)
+	}
+	if !errors.Is(res.Err, ErrServerError) {
+		t.Errorf("Err should match ErrServerError sentinel; got %v", res.Err)
+	}
+}
+
+func TestRunWithRetry_ExhaustionReturnsTrulyLastError(t *testing.T) {
+	c := retryTestClient(t)
+
+	err1 := serverError(http.StatusInternalServerError)
+	err2 := serverError(http.StatusBadGateway)
+	err3 := serverError(http.StatusServiceUnavailable)
+
+	seq := []*Error{err1, err2, err3}
+	var calls int
+	res := c.runWithRetry(context.Background(), 3, retryTestRequestID, retryTestEndpoint,
+		func() attemptResult {
+			defer func() { calls++ }()
+			return attemptResult{Outcome: outcomeRetry, Err: seq[calls]}
+		})
+
+	if calls != 3 {
+		t.Errorf("calls = %d, want 3", calls)
+	}
+	if res.Err != err3 {
+		t.Errorf("returned Err = %v, want err3 (the last in sequence)", res.Err)
+	}
+}
+
+func TestRunWithRetry_ContextCancelDuringBackoffStopsRetries(t *testing.T) {
+	// Use a long backoff so that during the cancel-during-backoff select,
+	// <time.After is NOT yet ready and <ctx.Done() is the only ready case.
+	// Go's select picks randomly when multiple cases are ready, so a 1µs
+	// backoff would be flaky.
+	c := New("https://example.test",
+		WithBackoff(100*time.Millisecond, 200*time.Millisecond),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls int
+	res := c.runWithRetry(ctx, 5, retryTestRequestID, retryTestEndpoint,
+		func() attemptResult {
+			calls++
+			// Cancel after the first failure so the runner's backoff
+			// sleep observes the cancellation.
+			if calls == 1 {
+				cancel()
+			}
+			return attemptResult{Outcome: outcomeRetry, Err: serverError(http.StatusServiceUnavailable)}
+		})
+
+	if calls != 1 {
+		t.Errorf("action calls = %d, want 1 (no retry after ctx cancel)", calls)
+	}
+	if res.Err == nil {
+		t.Fatal("expected error from ctx cancel, got nil")
+	}
+	if !errors.Is(res.Err, context.Canceled) {
+		t.Errorf("Err should wrap context.Canceled; got %v", res.Err)
+	}
+	if !errors.Is(res.Err, ErrTransport) {
+		t.Errorf("Err should match ErrTransport sentinel; got %v", res.Err)
+	}
+}
+
+func TestRunWithRetry_ContextErrInsideActionOverridesRetry(t *testing.T) {
+	// If the action's *Error wraps a context error (because the HTTP call
+	// saw a cancelled ctx), the runner must not retry — even if the action
+	// said outcomeRetry. This is the contract that "the client never
+	// retries on a cancelled context".
+	c := retryTestClient(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before any call
+
+	transport := transportError(context.Canceled)
+	var calls int
+	res := c.runWithRetry(ctx, 5, retryTestRequestID, retryTestEndpoint,
+		func() attemptResult {
+			calls++
+			return attemptResult{Outcome: outcomeRetry, Err: transport}
+		})
+
+	if calls != 1 {
+		t.Errorf("action calls = %d, want 1", calls)
+	}
+	if res.Err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(res.Err, context.Canceled) {
+		t.Errorf("Err should match context.Canceled; got %v", res.Err)
+	}
+}
+
+func TestRunWithRetry_ZeroAttemptsReturnsSentinelTransportError(t *testing.T) {
+	c := retryTestClient(t)
+
+	var calls int
+	res := c.runWithRetry(context.Background(), 0, retryTestRequestID, retryTestEndpoint,
+		func() attemptResult {
+			calls++
+			return attemptResult{Outcome: outcomeSuccess}
+		})
+
+	if calls != 0 {
+		t.Errorf("action calls = %d, want 0 (loop never runs)", calls)
+	}
+	if res.Err == nil {
+		t.Fatal("expected sentinel error for zero attempts")
+	}
+	if !errors.Is(res.Err, ErrTransport) {
+		t.Errorf("zero-attempts error should match ErrTransport; got %v", res.Err)
+	}
+}
+
+func TestRunWithRetry_LogsRetryBackoffLine(t *testing.T) {
+	var buf bytes.Buffer
+	c := New("https://example.test",
+		WithBackoff(1*time.Microsecond, 5*time.Microsecond),
+		WithLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))),
+	)
+
+	_ = c.runWithRetry(context.Background(), 3, retryTestRequestID, retryTestEndpoint,
+		func() attemptResult {
+			return attemptResult{Outcome: outcomeRetry, Err: serverError(http.StatusServiceUnavailable)}
+		})
+
+	out := buf.String()
+	if !strings.Contains(out, "retrying after backoff") {
+		t.Errorf("expected retry-backoff log; got %q", out)
+	}
+	if !strings.Contains(out, "delay=") {
+		t.Errorf("expected delay= key in log; got %q", out)
+	}
+	if !strings.Contains(out, retryTestRequestID) {
+		t.Errorf("expected request_id in log; got %q", out)
+	}
+}
+
+func TestRunWithRetry_LogsRetryableStatusWithStatusKey(t *testing.T) {
+	var buf bytes.Buffer
+	c := New("https://example.test",
+		WithBackoff(1*time.Microsecond, 5*time.Microsecond),
+		WithLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))),
+	)
+
+	_ = c.runWithRetry(context.Background(), 3, retryTestRequestID, retryTestEndpoint,
+		func() attemptResult {
+			return attemptResult{Outcome: outcomeRetry, Err: serverError(http.StatusBadGateway)}
+		})
+
+	out := buf.String()
+	if !strings.Contains(out, "retryable status, will retry") {
+		t.Errorf("expected retryable-status log; got %q", out)
+	}
+	if !strings.Contains(out, "status=502") {
+		t.Errorf("expected status=502 in log; got %q", out)
+	}
+}
+
+func TestRunWithRetry_LogsTransportErrKey(t *testing.T) {
+	var buf bytes.Buffer
+	c := New("https://example.test",
+		WithBackoff(1*time.Microsecond, 5*time.Microsecond),
+		WithLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))),
+	)
+
+	cause := errors.New("dial tcp: connection refused")
+	_ = c.runWithRetry(context.Background(), 2, retryTestRequestID, retryTestEndpoint,
+		func() attemptResult {
+			return attemptResult{Outcome: outcomeRetry, Err: transportError(cause)}
+		})
+
+	out := buf.String()
+	if !strings.Contains(out, "transport error") {
+		t.Errorf("expected transport-error log; got %q", out)
+	}
+	if !strings.Contains(out, "err=") {
+		t.Errorf("expected err= key in log; got %q", out)
+	}
+}
+
+func TestRunWithRetry_LogsClientErrorNotRetrying(t *testing.T) {
+	var buf bytes.Buffer
+	c := New("https://example.test",
+		WithBackoff(1*time.Microsecond, 5*time.Microsecond),
+		WithLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))),
+	)
+
+	_ = c.runWithRetry(context.Background(), 3, retryTestRequestID, retryTestEndpoint,
+		func() attemptResult {
+			return attemptResult{Outcome: outcomeFatal, Err: clientError(http.StatusBadRequest)}
+		})
+
+	out := buf.String()
+	if !strings.Contains(out, "client error, not retrying") {
+		t.Errorf("expected client-error log; got %q", out)
+	}
+	if !strings.Contains(out, "status=400") {
+		t.Errorf("expected status=400 in log; got %q", out)
+	}
+}
+
+func TestRunWithRetry_FirstAttemptLogsNothingBeforeIt(t *testing.T) {
+	// The "retrying after backoff" log must only fire between attempts,
+	// not before the first one.
+	var buf bytes.Buffer
+	c := New("https://example.test",
+		WithBackoff(1*time.Microsecond, 5*time.Microsecond),
+		WithLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))),
+	)
+
+	var calls int
+	_ = c.runWithRetry(context.Background(), 5, retryTestRequestID, retryTestEndpoint,
+		func() attemptResult {
+			calls++
+			return attemptResult{Outcome: outcomeSuccess}
+		})
+
+	out := buf.String()
+	if strings.Contains(out, "retrying after backoff") {
+		t.Errorf("first attempt should not log a retry; got %q", out)
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1", calls)
 	}
 }

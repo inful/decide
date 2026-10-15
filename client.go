@@ -147,6 +147,138 @@ func newLoggerOrDiscard(l Logger) Logger {
 
 // --- The call ---------------------------------------------------------------
 
+// attemptOutcome is what the per-attempt action reports back to runWithRetry.
+type attemptOutcome int
+
+const (
+	// outcomeSuccess: the attempt produced a 2xx response; Response is populated.
+	outcomeSuccess attemptOutcome = iota
+	// outcomeFatal: the attempt produced a non-retryable failure; Err is
+	// populated and runWithRetry returns immediately.
+	outcomeFatal
+	// outcomeRetry: the attempt produced a retryable failure; Err is
+	// populated and runWithRetry sleeps then tries again. A *Error whose
+	// cause is a context error is promoted to outcomeFatal regardless of
+	// this classification — the client never retries on a cancelled context.
+	outcomeRetry
+)
+
+// attemptResult is what runWithRetry's action closure returns.
+//
+// Exactly one of Response or Err is meaningful:
+//
+//   - Outcome == outcomeSuccess → Response is the *http.Response the caller
+//     must consume (typically via decodeResponse).
+//   - Outcome != outcomeSuccess → Err is the *Error to surface.
+type attemptResult struct {
+	Outcome  attemptOutcome
+	Response *http.Response
+	Err      *Error
+}
+
+// runWithRetry invokes action up to maxAttempts times, sleeping
+// c.retry.nextDelay between attempts. It returns the first successful
+// attemptResult or, after exhaustion, the last retryable error.
+//
+// Context cancellation terminates immediately in two places:
+//
+//  1. While sleeping between attempts. The returned *Error has ErrTransport
+//     as its sentinel and cause set to ctx.Err().
+//  2. If action returns an *Error that wraps context.Canceled or
+//     context.DeadlineExceeded (via errors.Is), even if the action
+//     classified it as outcomeRetry. This preserves the contract that
+//     the client never retries on a cancelled context.
+//
+// Logging keys are stable and identical to the pre-extraction inline loop:
+//
+//	"systemone: retrying after backoff" (Info):  attempt, of, delay, endpoint, request_id
+//	"systemone: transport error"        (Warn):  attempt, of, request_id, err
+//	"systemone: client error, not retrying"     (Info): status, request_id
+//	"systemone: retryable status, will retry"   (Warn): status, attempt, of, request_id
+//
+// runWithRetry is the seam that lets the retry contract be unit-tested
+// without spinning up an HTTP server.
+func (c *Client) runWithRetry(
+	ctx context.Context,
+	maxAttempts int,
+	requestID, endpoint string,
+	action func() attemptResult,
+) attemptResult {
+	var last attemptResult
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			delay := c.retry.nextDelay(attempt - 1)
+			c.logger.Info("systemone: retrying after backoff",
+				"attempt", attempt+1,
+				"of", maxAttempts,
+				"delay", delay,
+				"endpoint", endpoint,
+				"request_id", requestID,
+			)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return attemptResult{
+					Outcome: outcomeFatal,
+					Err:     wrapTransportError(http.MethodPost, endpoint, ctx.Err()),
+				}
+			}
+		}
+
+		res := action()
+		switch res.Outcome {
+		case outcomeSuccess:
+			return res
+
+		case outcomeFatal:
+			if res.Err != nil && res.Err.StatusCode != 0 {
+				c.logger.Info("systemone: client error, not retrying",
+					"status", res.Err.StatusCode,
+					"request_id", requestID,
+				)
+			}
+			return res
+
+		case outcomeRetry:
+			if res.Err != nil && isContextErr(res.Err) {
+				return res
+			}
+			if res.Err != nil && res.Err.StatusCode == 0 {
+				c.logger.Warn("systemone: transport error",
+					"attempt", attempt+1,
+					"of", maxAttempts,
+					"request_id", requestID,
+					"err", res.Err.Error(),
+				)
+			} else {
+				c.logger.Warn("systemone: retryable status, will retry",
+					"status", res.Err.StatusCode,
+					"attempt", attempt+1,
+					"of", maxAttempts,
+					"request_id", requestID,
+				)
+			}
+			last = res
+		}
+	}
+	if last.Err == nil {
+		// Defensive: callers should ensure maxAttempts >= 1, but if not,
+		// surface a sentinel error rather than panicking.
+		return attemptResult{
+			Outcome: outcomeFatal,
+			Err: &Error{
+				StatusCode: 0,
+				Status:     "no attempts made",
+				Method:     http.MethodPost,
+				URL:        endpoint,
+				Body:       "decide: retry policy yielded zero attempts",
+				sentinel:   ErrTransport,
+			},
+		}
+	}
+	return last
+}
+
 // SystemOne posts a Request to /v1/systemone and returns the parsed Response.
 // Non-2xx responses and transport errors are returned as *Error.
 func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) {
@@ -179,65 +311,28 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 		attempts = 1
 	}
 
-	var lastErr error
-	for attempt := 0; attempt < attempts; attempt++ {
-		if attempt > 0 {
-			delay := c.retry.nextDelay(attempt - 1)
-			c.logger.Info("systemone: retrying after backoff",
-				"attempt", attempt+1,
-				"of", attempts,
-				"delay", delay,
-				"endpoint", endpoint,
-				"request_id", requestID,
-			)
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done():
-				return nil, ctx.Err()
+	result := c.runWithRetry(ctx, attempts, requestID, endpoint,
+		func() attemptResult {
+			httpResp, transportErr := c.do(ctx, http.MethodPost, endpoint, body, requestID)
+			if transportErr != nil {
+				return attemptResult{Outcome: outcomeRetry, Err: transportErr}
 			}
-		}
-
-		httpResp, transportErr := c.do(ctx, http.MethodPost, endpoint, body, requestID)
-		if transportErr != nil {
-			lastErr = transportErr
-			if isContextErr(transportErr) {
-				return nil, transportErr
+			if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+				return attemptResult{Outcome: outcomeSuccess, Response: httpResp}
 			}
-			c.logger.Warn("systemone: transport error",
-				"attempt", attempt+1,
-				"of", attempts,
-				"request_id", requestID,
-				"err", transportErr.Error(),
-			)
-			continue
-		}
+			respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+			_ = httpResp.Body.Close()
+			httpErr := newHTTPError(http.MethodPost, endpoint, httpResp, respBody)
+			if httpErr.IsRetryable() {
+				return attemptResult{Outcome: outcomeRetry, Err: httpErr}
+			}
+			return attemptResult{Outcome: outcomeFatal, Err: httpErr}
+		})
 
-		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
-			return c.decodeResponse(httpResp)
-		}
-
-		respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
-		_ = httpResp.Body.Close()
-		httpErr := newHTTPError(http.MethodPost, endpoint, httpResp, respBody)
-
-		if !httpErr.IsRetryable() {
-			c.logger.Info("systemone: client error, not retrying",
-				"status", httpResp.StatusCode,
-				"request_id", requestID,
-			)
-			return nil, httpErr
-		}
-
-		c.logger.Warn("systemone: retryable status, will retry",
-			"status", httpResp.StatusCode,
-			"attempt", attempt+1,
-			"of", attempts,
-			"request_id", requestID,
-		)
-		lastErr = httpErr
+	if result.Err != nil {
+		return nil, result.Err
 	}
-
-	return nil, lastErr
+	return c.decodeResponse(result.Response)
 }
 
 func (c *Client) do(ctx context.Context, method, url string, body []byte, requestID string) (*http.Response, *Error) {
