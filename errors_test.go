@@ -53,6 +53,11 @@ func TestErrorError_KeepsMultiByteCharactersIntact(t *testing.T) {
 }
 
 func TestErrorIsRetryable(t *testing.T) {
+	var nilErr *Error
+	if nilErr.IsRetryable() {
+		t.Error("a nil *Error is not retryable")
+	}
+
 	cases := []struct {
 		code int
 		want bool

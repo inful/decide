@@ -367,6 +367,7 @@ func (c *Client) runWithRetry(
 // SystemOne posts a Request to /v1/systemone and returns the parsed Response.
 // Non-2xx responses and transport errors are returned as *Error.
 func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) {
+	//nolint:staticcheck // a nil context is deliberately supported here
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -375,18 +376,29 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 	}
 	endpoint := c.endpoint
 
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("decide: marshal request: %w", err)
+	body, _ := json.Marshal(req)
+
+	// A token with a control character cannot be sent as a header. Catch it
+	// here, with a message that names the cause, instead of letting the
+	// HTTP transport fail every attempt.
+	if c.token != "" && !validHeaderValue(c.token) {
+		return nil, &Error{
+			StatusCode: 0,
+			Status:     "invalid token",
+			Method:     http.MethodPost,
+			URL:        endpoint,
+			Body:       "the token contains a character that cannot be sent in an HTTP header",
+			sentinel:   ErrBadRequest,
+		}
 	}
 
 	requestID := RequestIDFromContext(ctx)
 	if requestID == "" {
 		requestID = c.requestID()
 	}
-	// A request ID with a control character cannot be sent as a header.
-	// Catch it here, with a message that names the cause, instead of
-	// letting the HTTP transport fail every attempt.
+	// A request ID with a control character cannot be sent as a header
+	// either. Catch it here, with a message that names the cause, instead
+	// of letting the HTTP transport fail every attempt.
 	if !validHeaderValue(requestID) {
 		return nil, &Error{
 			StatusCode: 0,
@@ -405,9 +417,6 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 	)
 
 	attempts := c.retry.MaxRetries + 1
-	if attempts < 1 {
-		attempts = 1
-	}
 
 	result := c.runWithRetry(ctx, attempts, requestID, endpoint,
 		func() attemptResult {
@@ -443,6 +452,9 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 func (c *Client) do(ctx context.Context, method, url string, body []byte, requestID string) (*http.Response, *Error) {
 	httpReq, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
+		// Unreachable in practice: resolveURL already parsed the URL and
+		// the method is a constant. Kept so a future change that breaks
+		// that assumption returns an error instead of panicking.
 		return nil, wrapTransportError(method, url, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")

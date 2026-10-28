@@ -1,0 +1,18 @@
+version: "2"
+
+linters:
+  # Default set (errcheck, govet, ineffassign, staticcheck, unused) plus:
+  enable:
+    # Reports http.Response bodies that are never closed.
+    - bodyclose
+    # Catches suspicious code that passes the Go vet suite but is not
+    # idiomatic.
+    - gocritic
+    # Catches typos in comments and identifiers.
+    - misspell
+
+formatters:
+  # gofmt is not on by default in golangci-lint v2, so a formatting drift
+  # can pass CI unnoticed. The CI workflow also runs gofmt directly.
+  enable:
+    - gofmt

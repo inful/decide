@@ -20,14 +20,18 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to a commit SHA so a moved tag cannot change
+      # what runs here. The version goes in the comment.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           # Use the version declared in go.mod so the CI matches the
           # project's stated minimum; bumping go.mod bumps CI automatically.
           go-version-file: go.mod
-          cache: true
+          # No module cache: this package has no dependencies, so there is
+          # no go.sum for setup-go to hash and the cache never restores
+          # anything.
 
       - name: go mod tidy (check)
         # Catches a forgotten `go mod tidy` before tests run.
@@ -57,7 +61,7 @@ jobs:
 
       - name: Upload coverage artifact
         if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage
           path: coverage.out
@@ -67,9 +71,9 @@ jobs:
     name: build with the minimum Go we claim
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.22.x'
 
@@ -87,17 +91,16 @@ jobs:
     name: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
-          cache: true
 
       # Pin to the same golangci-lint major used locally. golangci-lint-action
       # v6 only handles golangci-lint v1.x; for v2.x we need v7 of the action.
       # v1.x is built with Go 1.24 and refuses to lint code targeting
       # go1.26+. Bump the pin when bumping the local install.
-      - uses: golangci/golangci-lint-action@v7
+      - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7
         with:
           version: v2.14.0

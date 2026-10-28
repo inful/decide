@@ -316,6 +316,93 @@ func TestClient_AppendsV1SystemOnePath(t *testing.T) {
 	}
 }
 
+func TestClient_SystemOne_InvalidTokenFailsFast(t *testing.T) {
+	// A token with a newline cannot be sent as a header. The client must
+	// say so instead of failing every attempt as a transport error.
+	// A trailing newline is the classic source: os.Getenv does not strip it.
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		_, _ = w.Write([]byte(responseFixture))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk-live-abc\n"))
+	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
+
+	if err == nil {
+		t.Fatal("expected an error for an invalid token")
+	}
+	if !errors.Is(err, ErrBadRequest) {
+		t.Errorf("err should match ErrBadRequest; got %v", err)
+	}
+	if attempts.Load() != 0 {
+		t.Errorf("server saw %d attempts, want 0 (the request must not be sent)", attempts.Load())
+	}
+	if strings.Contains(err.Error(), "transport") {
+		t.Errorf("error should name the real cause, not a transport failure; got %v", err)
+	}
+	e, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("expected *Error, got %T", err)
+	}
+	if e.IsRetryable() {
+		t.Error("an invalid token is not retryable")
+	}
+}
+
+func TestClient_SystemOne_NilContextIsSupported(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(responseFixture))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"))
+	//nolint:staticcheck // deliberately exercising the nil-context support
+	resp, err := c.SystemOne(nil, Request{State: State{Body: "hi"}})
+	if err != nil {
+		t.Fatalf("SystemOne with a nil context: %v", err)
+	}
+	if len(resp.Answers) == 0 {
+		t.Fatalf("expected answers, got %#v", resp)
+	}
+}
+
+func TestClient_SystemOne_ErrorBodyReadFailureIsReported(t *testing.T) {
+	// If the connection drops part way through the error body, the caller
+	// must be able to tell that the body is incomplete.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("partial"))
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("server does not support hijacking")
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"), WithRetries(0))
+	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	e, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("expected *Error, got %T", err)
+	}
+	if !strings.Contains(e.Body, "body read failed") {
+		t.Errorf("Error.Body should mention the read failure; got %q", e.Body)
+	}
+}
+
 func TestClient_BaseURLValidation(t *testing.T) {
 	if c := New(""); c.baseURL != "" {
 		t.Errorf("empty baseURL should be preserved (caller decides whether to use it)")

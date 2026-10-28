@@ -74,6 +74,54 @@ func TestParseRetryAfter_HTTPDate(t *testing.T) {
 	if got := parseRetryAfter(past); got != 0 {
 		t.Errorf("parseRetryAfter(%q) = %v, want 0", past, got)
 	}
+
+	// A date far in the future is clamped, so one request cannot pin a
+	// goroutine for minutes.
+	far := time.Now().Add(2 * time.Hour).UTC().Format(http.TimeFormat)
+	if got := parseRetryAfter(far); got != maxRetryAfter {
+		t.Errorf("parseRetryAfter(%q) = %v, want the %v clamp", far, got, maxRetryAfter)
+	}
+}
+
+func TestValidHeaderValue(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"", true},
+		{"plain", true},
+		{"with space", true},
+		{"tab\there", true}, // Go allows a tab in a header value
+		{"non-ascii-é", true},
+		{"newline\n", false},
+		{"carriage\r", false},
+		{"nul\x00", false},
+		{"del\x7f", false},
+	}
+	for _, tc := range cases {
+		if got := validHeaderValue(tc.in); got != tc.want {
+			t.Errorf("validHeaderValue(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestResolveURL_RejectsControlCharacters(t *testing.T) {
+	// A base URL with a newline is rejected up front rather than failing
+	// every request as a transport error.
+	_, err := resolveURL("https://example.com/\nX-Injected", "/v1/systemone")
+	if err == nil {
+		t.Fatal("expected an error for a base URL with a control character")
+	}
+	if !strings.Contains(err.Error(), "control character") {
+		t.Errorf("error should name the cause; got %v", err)
+	}
+}
+
+func TestWithContextRequestID_EmptyIDIsIgnored(t *testing.T) {
+	ctx := WithContextRequestID(context.Background(), "")
+	if got := RequestIDFromContext(ctx); got != "" {
+		t.Errorf("RequestIDFromContext = %q, want %q for an empty ID", got, "")
+	}
 }
 
 func TestDecodeResponse_TooLargeBodyReturnsDistinctError(t *testing.T) {

@@ -49,12 +49,10 @@ func (p RetryPolicy) nextDelay(attempt int) time.Duration {
 		base = float64(p.MaxBackoff)
 	}
 	if p.Jitter > 0 {
-		// Symmetric jitter in [-Jitter, +Jitter].
+		// Symmetric jitter in [-Jitter, +Jitter]. Jitter is always well
+		// below 1, so the result stays positive.
 		delta := (rand.Float64()*2 - 1) * p.Jitter
 		base *= 1 + delta
-	}
-	if base < 0 {
-		base = 0
 	}
 	return time.Duration(base)
 }

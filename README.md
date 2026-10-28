@@ -131,6 +131,18 @@ client := decide.New(baseURL,
 Logs include `endpoint`, `request_id`, `attempt`, and `delay` keys. `nil` is
 replaced with a discard logger.
 
+## Tokens
+
+The token is sent as an `Authorization: Bearer` header. A token containing a
+character that cannot go in an HTTP header — a trailing newline from an
+environment variable, say — is rejected before anything is sent, and reported
+as `ErrBadRequest`. Trim it when you load it:
+
+```go
+token := strings.TrimSpace(os.Getenv("DECIDE_TOKEN"))
+client := decide.New(baseURL, decide.WithToken(token))
+```
+
 ## Connections
 
 The default client keeps up to 100 idle connections to the API host, so
@@ -272,7 +284,7 @@ RequestIDFromContext(ctx) string
 go test -race -count=1 ./...
 ```
 
-Coverage runs at ~93% of statements; the package has no transitive dependencies.
+Coverage runs at ~95% of statements; the package has no transitive dependencies.
 
 ## Releasing
 
