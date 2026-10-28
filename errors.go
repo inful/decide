@@ -9,14 +9,15 @@ import (
 // Sentinel errors so callers can branch on categories with errors.Is.
 // They are unwrapped from *Error (and any wrapping transport error).
 var (
-	ErrBadRequest      = errors.New("decide: bad request")
-	ErrUnauthorized    = errors.New("decide: unauthorized")
-	ErrForbidden       = errors.New("decide: forbidden")
-	ErrNotFound       = errors.New("decide: not found")
-	ErrRateLimited     = errors.New("decide: rate limited")
-	ErrServerError     = errors.New("decide: server error")
-	ErrTransport       = errors.New("decide: transport error")
-	ErrResponseDecoded = errors.New("decide: response decode error")
+	ErrBadRequest       = errors.New("decide: bad request")
+	ErrUnauthorized     = errors.New("decide: unauthorized")
+	ErrForbidden        = errors.New("decide: forbidden")
+	ErrNotFound         = errors.New("decide: not found")
+	ErrRateLimited      = errors.New("decide: rate limited")
+	ErrServerError      = errors.New("decide: server error")
+	ErrTransport        = errors.New("decide: transport error")
+	ErrResponseDecoded  = errors.New("decide: response decode error")
+	ErrResponseTooLarge = errors.New("decide: response too large")
 )
 
 // Error is the concrete error type returned by Client calls. It carries the
@@ -36,10 +37,7 @@ type Error struct {
 }
 
 func (e *Error) Error() string {
-	body := e.Body
-	if len(body) > 512 {
-		body = body[:512] + "...(truncated)"
-	}
+	body := truncate(e.Body, 512)
 	if e.StatusCode == 0 {
 		return fmt.Sprintf("decide: %s %s: %s: %s", e.Method, e.URL, e.Status, body)
 	}

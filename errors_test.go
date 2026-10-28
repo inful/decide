@@ -3,7 +3,9 @@ package decide
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestErrorError(t *testing.T) {
@@ -33,6 +35,20 @@ func TestErrorError_TruncatesLongBody(t *testing.T) {
 	msg := err.Error()
 	if len(msg) > 800 {
 		t.Errorf("error message length %d, expected truncation below 800", len(msg))
+	}
+}
+
+func TestErrorError_KeepsMultiByteCharactersIntact(t *testing.T) {
+	// "€" is 3 bytes, so the 512-byte cut lands inside one of them.
+	body := strings.Repeat("a", 510) + "€€€"
+	err := &Error{
+		StatusCode: 500,
+		Status:     "Internal Server Error",
+		Body:       body,
+	}
+	msg := err.Error()
+	if !utf8.ValidString(msg) {
+		t.Errorf("error message is not valid UTF-8: %q", msg)
 	}
 }
 

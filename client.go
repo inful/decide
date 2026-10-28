@@ -9,8 +9,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // systemOnePath is the API path used by SystemOne.
@@ -23,6 +25,39 @@ const requestIDHeader = "X-Request-ID"
 // responseBodyCap caps the size of a response body the client will read into
 // memory; responses beyond this are not a server contract we promise to honor.
 const responseBodyCap = 8 << 20 // 8 MiB
+
+// errorBodyCap caps how much of a non-2xx response body is kept for the
+// error message. Error bodies are diagnostics, not data we promise to return.
+const errorBodyCap = 1 << 20 // 1 MiB
+
+// maxRetryAfter caps how long the client will honor a server's Retry-After
+// header. Longer waits fall back to the normal backoff, so one request can
+// never pin a goroutine for minutes on a hostile or buggy server.
+const maxRetryAfter = 30 * time.Second
+
+// defaultTransport is the transport shared by every Client created without
+// WithHTTPClient.
+//
+// Go's http.DefaultTransport keeps only 2 idle connections per host
+// (DefaultMaxIdleConnsPerHost). This client talks to exactly one API host,
+// so any burst past two in-flight requests opens a fresh TCP connection —
+// and a fresh TLS handshake over HTTPS. Cloning the default and raising the
+// per-host limit keeps connections alive between bursts.
+var defaultTransport = newTransport(http.DefaultTransport)
+
+// newTransport copies base and raises its per-host idle connection limit.
+func newTransport(base http.RoundTripper) *http.Transport {
+	tr, ok := base.(*http.Transport)
+	if !ok {
+		// The default transport was replaced with a custom RoundTripper.
+		// Fall back to a plain transport rather than panicking during
+		// package init.
+		tr = &http.Transport{Proxy: http.ProxyFromEnvironment}
+	}
+	out := tr.Clone()
+	out.MaxIdleConnsPerHost = 100
+	return out
+}
 
 // Client is the entry point for the library. Configure with New and customize
 // with functional Options. A Client is safe for concurrent use.
@@ -44,7 +79,7 @@ type Option func(*Client)
 func New(baseURL string, opts ...Option) *Client {
 	c := &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
-		httpClient: &http.Client{Timeout: 60 * time.Second},
+		httpClient: &http.Client{Transport: defaultTransport, Timeout: 60 * time.Second},
 		retry:      DefaultRetryPolicy(),
 		requestID:  newUUIDv4,
 	}
@@ -52,9 +87,6 @@ func New(baseURL string, opts ...Option) *Client {
 		opt(c)
 	}
 	c.logger = newLoggerOrDiscard(c.logger)
-	if c.httpClient == nil {
-		c.httpClient = &http.Client{Timeout: 60 * time.Second}
-	}
 	return c
 }
 
@@ -74,8 +106,8 @@ func WithHTTPClient(hc *http.Client) Option {
 }
 
 // WithRetries sets the maximum number of retries after the initial attempt.
-// Pass a negative value to keep the default but allow the call site to also
-// pass WithBackoff; pass 0 to disable retries entirely.
+// Pass a negative value to leave the default unchanged; pass 0 to disable
+// retries entirely.
 func WithRetries(n int) Option {
 	return func(c *Client) {
 		if n < 0 {
@@ -134,12 +166,19 @@ func RequestIDFromContext(ctx context.Context) string {
 	return v
 }
 
-func (c *Client) newRequestID() string {
-	return c.requestID()
-}
-
+// newLoggerOrDiscard returns l, or a logger that drops everything if l is
+// unusable.
+//
+// A nil interface and an interface holding a nil pointer are different
+// things: the second passes an `l == nil` check but panics the moment it is
+// called. Callers often have a `*slog.Logger` field that may be nil, so
+// check the pointer too.
 func newLoggerOrDiscard(l Logger) Logger {
 	if l == nil {
+		return DiscardLogger{}
+	}
+	v := reflect.ValueOf(l)
+	if v.Kind() == reflect.Pointer && v.IsNil() {
 		return DiscardLogger{}
 	}
 	return l
@@ -174,6 +213,10 @@ type attemptResult struct {
 	Outcome  attemptOutcome
 	Response *http.Response
 	Err      *Error
+
+	// RetryAfter, when non-zero, replaces the computed backoff before the
+	// next attempt. Servers send it on 429 and 503 to say when to come back.
+	RetryAfter time.Duration
 }
 
 // runWithRetry invokes action up to maxAttempts times, sleeping
@@ -196,6 +239,9 @@ type attemptResult struct {
 //	"systemone: client error, not retrying"     (Info): status, request_id
 //	"systemone: retryable status, will retry"   (Warn): status, attempt, of, request_id
 //
+// When the server sent a Retry-After header, the delay before the next
+// attempt is that value instead of the computed backoff.
+//
 // runWithRetry is the seam that lets the retry contract be unit-tested
 // without spinning up an HTTP server.
 func (c *Client) runWithRetry(
@@ -205,9 +251,13 @@ func (c *Client) runWithRetry(
 	action func() attemptResult,
 ) attemptResult {
 	var last attemptResult
+	var wait time.Duration
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			delay := c.retry.nextDelay(attempt - 1)
+			delay := wait
+			if delay <= 0 {
+				delay = c.retry.nextDelay(attempt - 1)
+			}
 			c.logger.Info("systemone: retrying after backoff",
 				"attempt", attempt+1,
 				"of", maxAttempts,
@@ -226,6 +276,7 @@ func (c *Client) runWithRetry(
 		}
 
 		res := action()
+		wait = res.RetryAfter
 		switch res.Outcome {
 		case outcomeSuccess:
 			return res
@@ -297,7 +348,7 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 
 	requestID := RequestIDFromContext(ctx)
 	if requestID == "" {
-		requestID = c.newRequestID()
+		requestID = c.requestID()
 	}
 
 	c.logger.Debug("systemone: sending request",
@@ -320,11 +371,18 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 			if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
 				return attemptResult{Outcome: outcomeSuccess, Response: httpResp}
 			}
-			respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+			respBody, readErr := io.ReadAll(io.LimitReader(httpResp.Body, errorBodyCap))
 			_ = httpResp.Body.Close()
 			httpErr := newHTTPError(http.MethodPost, endpoint, httpResp, respBody)
+			if readErr != nil {
+				httpErr.Body = fmt.Sprintf("%s (body read failed: %v)", httpErr.Body, readErr)
+			}
 			if httpErr.IsRetryable() {
-				return attemptResult{Outcome: outcomeRetry, Err: httpErr}
+				return attemptResult{
+					Outcome:    outcomeRetry,
+					Err:        httpErr,
+					RetryAfter: parseRetryAfter(httpResp.Header.Get("Retry-After")),
+				}
 			}
 			return attemptResult{Outcome: outcomeFatal, Err: httpErr}
 		})
@@ -332,7 +390,7 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 	if result.Err != nil {
 		return nil, result.Err
 	}
-	return c.decodeResponse(result.Response)
+	return c.decodeResponse(result.Response, requestID)
 }
 
 func (c *Client) do(ctx context.Context, method, url string, body []byte, requestID string) (*http.Response, *Error) {
@@ -353,26 +411,48 @@ func (c *Client) do(ctx context.Context, method, url string, body []byte, reques
 	return httpResp, nil
 }
 
-func (c *Client) decodeResponse(httpResp *http.Response) (*Response, error) {
+func (c *Client) decodeResponse(httpResp *http.Response, sentRequestID string) (*Response, error) {
 	defer func() { _ = httpResp.Body.Close() }()
 
-	body, err := io.ReadAll(io.LimitReader(httpResp.Body, responseBodyCap))
+	// Read one byte past the cap so an oversized body is detected rather
+	// than silently cut into an unparseable prefix.
+	body, err := io.ReadAll(io.LimitReader(httpResp.Body, responseBodyCap+1))
 	if err != nil {
 		return nil, wrapTransportError(http.MethodPost, httpResp.Request.URL.String(), err)
 	}
-
-	var resp Response
-	if err := json.Unmarshal(body, &resp); err != nil {
+	if len(body) > responseBodyCap {
 		return nil, &Error{
 			StatusCode: httpResp.StatusCode,
 			Status:     httpResp.Status,
 			Method:     http.MethodPost,
 			URL:        httpResp.Request.URL.String(),
-			Body:       fmt.Sprintf("decode error: %v; raw: %s", err, truncate(string(body), 512)),
+			Body:       fmt.Sprintf("response body exceeds the %d byte limit", responseBodyCap),
+			sentinel:   ErrResponseTooLarge,
+		}
+	}
+
+	var resp Response
+	if err := json.Unmarshal(body, &resp); err != nil {
+		// Only the first 512 bytes of the raw body are kept, plus one more
+		// so truncate can tell whether it landed inside a multi-byte
+		// character.
+		raw := body
+		if len(raw) > 513 {
+			raw = raw[:513]
+		}
+		return nil, &Error{
+			StatusCode: httpResp.StatusCode,
+			Status:     httpResp.Status,
+			Method:     http.MethodPost,
+			URL:        httpResp.Request.URL.String(),
+			Body:       fmt.Sprintf("decode error: %v; raw: %s", err, truncate(string(raw), 512)),
 			sentinel:   ErrResponseDecoded,
 		}
 	}
 	resp.requestID = httpResp.Header.Get(requestIDHeader)
+	if resp.requestID == "" {
+		resp.requestID = sentRequestID
+	}
 	return &resp, nil
 }
 
@@ -391,9 +471,20 @@ func (c *Client) resolve(path string) (string, error) {
 	return u.String(), nil
 }
 
+// truncate shortens s to at most n bytes and marks that it cut.
+//
+// The cut never lands inside a multi-byte character: s[:n] would split one
+// in half and leave invalid UTF-8 in error messages and log lines.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "...(truncated)"
+	if n <= 0 {
+		return ""
+	}
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "...(truncated)"
 }

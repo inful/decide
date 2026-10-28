@@ -7,9 +7,11 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -62,8 +64,8 @@ func TestWithRequestIDFunc_Override(t *testing.T) {
 		calls++
 		return "fixed-id"
 	}))
-	if got := c.newRequestID(); got != "fixed-id" {
-		t.Errorf("newRequestID = %q, want fixed-id", got)
+	if got := c.requestID(); got != "fixed-id" {
+		t.Errorf("requestID = %q, want fixed-id", got)
 	}
 	if calls != 1 {
 		t.Errorf("custom func not invoked; calls = %d", calls)
@@ -72,7 +74,7 @@ func TestWithRequestIDFunc_Override(t *testing.T) {
 
 func TestNewRequestID_DefaultsToUUIDShape(t *testing.T) {
 	c := New("https://example.test")
-	id := c.newRequestID()
+	id := c.requestID()
 	if len(id) != 36 {
 		t.Errorf("UUID-shaped length = %d, want 36", len(id))
 	}
@@ -83,11 +85,11 @@ func TestNewRequestID_DefaultsToUUIDShape(t *testing.T) {
 
 func TestClient_SystemOne_HappyPath(t *testing.T) {
 	var (
-		gotMethod     string
-		gotAuth       string
+		gotMethod      string
+		gotAuth        string
 		gotContentType string
-		gotBody       []byte
-		gotReqID      string
+		gotBody        []byte
+		gotReqID       string
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -269,8 +271,7 @@ func TestClient_SystemOne_LoggerObservesRetries(t *testing.T) {
 		WithToken("sk"),
 		WithRetries(2),
 		WithBackoff(1*time.Millisecond, 5*time.Millisecond),
-		WithLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})),
-		))
+		WithLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))))
 
 	_, _ = c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 
@@ -305,7 +306,7 @@ func TestClient_AppendsV1SystemOnePath(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	c := New(srv.URL + "/", WithToken("sk"))
+	c := New(srv.URL+"/", WithToken("sk"))
 	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 	if err != nil {
 		t.Fatalf("SystemOne: %v", err)
@@ -321,5 +322,164 @@ func TestClient_BaseURLValidation(t *testing.T) {
 	}
 	if c := New("not-a-url"); c.baseURL != "not-a-url" {
 		t.Errorf("garbage baseURL should be preserved; validation happens at call time")
+	}
+}
+
+func TestClient_SystemOne_RequestIDFallsBackToSentID(t *testing.T) {
+	// The server does not echo X-Request-ID. The response must still carry
+	// the ID the client sent, so the caller can always correlate.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(responseFixture))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"), WithRequestIDFunc(func() string { return "sent-id" }))
+	resp, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
+	if err != nil {
+		t.Fatalf("SystemOne: %v", err)
+	}
+	if got := resp.RequestID(); got != "sent-id" {
+		t.Errorf("RequestID() = %q, want %q (the ID the client sent)", got, "sent-id")
+	}
+}
+
+func TestClient_SystemOne_RequestIDFallsBackToContextID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(responseFixture))
+	}))
+	t.Cleanup(srv.Close)
+
+	ctx := WithContextRequestID(context.Background(), "upstream-id")
+	c := New(srv.URL, WithToken("sk"))
+	resp, err := c.SystemOne(ctx, Request{State: State{Body: "hi"}})
+	if err != nil {
+		t.Fatalf("SystemOne: %v", err)
+	}
+	if got := resp.RequestID(); got != "upstream-id" {
+		t.Errorf("RequestID() = %q, want %q", got, "upstream-id")
+	}
+}
+
+func TestClient_SystemOne_HonorsRetryAfter(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(responseFixture))
+	}))
+	t.Cleanup(srv.Close)
+
+	var buf bytes.Buffer
+	c := New(srv.URL, WithToken("sk"), WithRetries(3),
+		WithBackoff(1*time.Millisecond, 5*time.Millisecond),
+		WithLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))),
+	)
+
+	start := time.Now()
+	resp, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
+	if err != nil {
+		t.Fatalf("SystemOne: %v", err)
+	}
+	if len(resp.Answers) == 0 {
+		t.Fatalf("expected answers, got %#v", resp)
+	}
+	// The server asked for a 1s wait; the computed backoff was 1ms.
+	if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
+		t.Errorf("retried after %v, want at least ~1s (Retry-After must be honored)", elapsed)
+	}
+	if !strings.Contains(buf.String(), "delay=1s") {
+		t.Errorf("expected the logged delay to be 1s from Retry-After; got %q", buf.String())
+	}
+}
+
+func TestNew_TypedNilLoggerIsIgnored(t *testing.T) {
+	// A nil *slog.Logger stored in a Logger interface is not a nil
+	// interface; calling it would panic. The client must fall back to the
+	// discard logger instead.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(responseFixture))
+	}))
+	t.Cleanup(srv.Close)
+
+	var lg *slog.Logger
+	c := New(srv.URL, WithToken("sk"), WithLogger(lg))
+	if _, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}}); err != nil {
+		t.Fatalf("SystemOne: %v", err)
+	}
+}
+
+func TestNewTransport_RaisesIdleConnectionLimit(t *testing.T) {
+	tr := newTransport(http.DefaultTransport)
+	if tr.MaxIdleConnsPerHost < 100 {
+		t.Errorf("MaxIdleConnsPerHost = %d, want >= 100", tr.MaxIdleConnsPerHost)
+	}
+	if tr == http.DefaultTransport.(*http.Transport) {
+		t.Error("newTransport must copy, not mutate, the base transport")
+	}
+}
+
+func TestNewTransport_CustomRoundTripperDoesNotPanic(t *testing.T) {
+	// Someone replaced http.DefaultTransport with a non-*Transport. The
+	// package must still initialise.
+	tr := newTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, nil
+	}))
+	if tr == nil {
+		t.Fatal("newTransport returned nil")
+	}
+	if tr.MaxIdleConnsPerHost < 100 {
+		t.Errorf("MaxIdleConnsPerHost = %d, want >= 100", tr.MaxIdleConnsPerHost)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestDefaultTransportReusesConnections(t *testing.T) {
+	// Go's default transport keeps only 2 idle connections per host. This
+	// client talks to one host, so bursts would otherwise reopen a
+	// connection (and a TLS handshake) every time.
+	if defaultTransport.MaxIdleConnsPerHost < 100 {
+		t.Fatalf("default transport MaxIdleConnsPerHost = %d, want >= 100",
+			defaultTransport.MaxIdleConnsPerHost)
+	}
+
+	var opened atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(responseFixture))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			opened.Add(1)
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"))
+
+	burst := func() {
+		var wg sync.WaitGroup
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, _ = c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
+			}()
+		}
+		wg.Wait()
+	}
+
+	burst()
+	first := opened.Load()
+	burst()
+	second := opened.Load() - first
+
+	if second > 2 {
+		t.Errorf("second burst of 10 concurrent calls opened %d new connections, want ~0 (pool reuse broken)", second)
 	}
 }

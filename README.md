@@ -76,6 +76,7 @@ case errors.Is(err, decide.ErrRateLimited):    // 429 — back off (already retr
 case errors.Is(err, decide.ErrServerError):    // 5xx — back off (already retried)
 case errors.Is(err, decide.ErrTransport):      // network/dial/TLS (already retried)
 case errors.Is(err, decide.ErrResponseDecoded):// unexpected payload shape
+case errors.Is(err, decide.ErrResponseTooLarge):// body past the 8 MiB limit
 case err != nil:
     return err
 }
@@ -100,6 +101,12 @@ client := decide.New(baseURL,
 Pass `WithRetries(0)` to disable retries entirely. Context cancellation aborts
 the loop immediately; the client never retries on a cancelled context.
 
+When the server sends a `Retry-After` header, the client waits that long
+instead of its own backoff, so a rate limit that clears in a few seconds is
+not turned into a failure. Waits longer than 30 s are capped at 30 s, so one
+request can never block for minutes; set a context deadline if you need a
+different bound.
+
 ## Logging
 
 Pass any `*slog.Logger` to a logger; it satisfies the `Logger` interface
@@ -114,11 +121,22 @@ client := decide.New(baseURL,
 Logs include `endpoint`, `request_id`, `attempt`, and `delay` keys. `nil` is
 replaced with a discard logger.
 
+## Connections
+
+The default client keeps up to 100 idle connections to the API host, so
+concurrent calls reuse connections instead of opening a new TCP connection
+(and a new TLS handshake) each time. Go's stock transport keeps only 2 per
+host, which is too few for a client that talks to a single endpoint.
+
+Pass your own `*http.Client` with `WithHTTPClient` if you need different
+pool, proxy, or timeout settings.
+
 ## Request IDs
 
 The client generates a UUID v4 per request and sends it as `X-Request-ID`. The
-response's `RequestID()` returns the value the server echoed back (or the
-generated one, if the server didn't echo).
+response's `RequestID()` returns the value the server echoed back, or the one
+the client sent if the server did not echo it — so you always get an ID you
+can correlate on.
 
 Propagate an upstream ID from your caller's context:
 
@@ -224,7 +242,8 @@ Usage       { InputTokens, OutputTokens, StateTokens, StateTokensDropped,
 
 // Sentinels (match with errors.Is)
 ErrBadRequest, ErrUnauthorized, ErrForbidden, ErrNotFound,
-ErrRateLimited, ErrServerError, ErrTransport, ErrResponseDecoded
+ErrRateLimited, ErrServerError, ErrTransport, ErrResponseDecoded,
+ErrResponseTooLarge
 
 // Context
 WithContextRequestID(ctx, id) context.Context
@@ -240,7 +259,7 @@ RequestIDFromContext(ctx) string
 go test -race -count=1 ./...
 ```
 
-Coverage runs at ~90% of statements; the package has no transitive dependencies.
+Coverage runs at ~93% of statements; the package has no transitive dependencies.
 
 ## Releasing
 

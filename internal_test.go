@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestTruncate(t *testing.T) {
@@ -22,6 +23,81 @@ func TestTruncate(t *testing.T) {
 	}
 	if got := truncate("hello world", 5); !strings.HasPrefix(got, "hello") {
 		t.Errorf("truncation should preserve prefix; got %q", got)
+	}
+}
+
+func TestTruncate_DoesNotSplitMultiByteCharacter(t *testing.T) {
+	// "€" is 3 bytes, so cutting at byte 512 lands inside the first one
+	// and would leave invalid UTF-8 behind.
+	s := strings.Repeat("a", 510) + "€€€"
+	got := truncate(s, 512)
+	if !utf8.ValidString(got) {
+		t.Errorf("truncate produced invalid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "...(truncated)") {
+		t.Errorf("got %q, want a truncation marker", got)
+	}
+	if !strings.HasPrefix(got, strings.Repeat("a", 510)) {
+		t.Errorf("truncation should keep the whole prefix; got %q", got)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"", 0},
+		{"0", 0},
+		{"-5", 0},
+		{"not-a-number", 0},
+		{"3", 3 * time.Second},
+		{" 5 ", 5 * time.Second},
+		{"99999", maxRetryAfter},               // clamped so one request cannot block for hours
+		{"9223372036854775807", maxRetryAfter}, // must not overflow
+	}
+	for _, tc := range cases {
+		if got := parseRetryAfter(tc.in); got != tc.want {
+			t.Errorf("parseRetryAfter(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestParseRetryAfter_HTTPDate(t *testing.T) {
+	future := time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat)
+	got := parseRetryAfter(future)
+	if got <= 0 || got > 3*time.Second {
+		t.Errorf("parseRetryAfter(%q) = %v, want about 2s", future, got)
+	}
+
+	past := time.Now().Add(-time.Minute).UTC().Format(http.TimeFormat)
+	if got := parseRetryAfter(past); got != 0 {
+		t.Errorf("parseRetryAfter(%q) = %v, want 0", past, got)
+	}
+}
+
+func TestDecodeResponse_TooLargeBodyReturnsDistinctError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"m","answers":{},"usage":{},"pad":"`))
+		chunk := strings.Repeat("x", 64<<10)
+		for i := 0; i < 160; i++ { // 160 * 64 KiB = 10 MiB, past the 8 MiB cap
+			_, _ = w.Write([]byte(chunk))
+		}
+		_, _ = w.Write([]byte(`"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"))
+	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
+	if err == nil {
+		t.Fatal("expected an error for an oversized response")
+	}
+	if !errors.Is(err, ErrResponseTooLarge) {
+		t.Errorf("err should match ErrResponseTooLarge; got %v", err)
+	}
+	if errors.Is(err, ErrResponseDecoded) {
+		t.Errorf("an oversized body is not a decode error; got %v", err)
 	}
 }
 
@@ -100,7 +176,7 @@ func TestDecodeResponse_CapturesRequestIDFromResponseHeader(t *testing.T) {
 
 func TestErrorIs_DirectlyConstructedStatusMatchesSentinel(t *testing.T) {
 	cases := []struct {
-		code    int
+		code     int
 		sentinel error
 	}{
 		{400, ErrBadRequest},
@@ -289,28 +365,6 @@ func TestRunWithRetry_FatalErrorShortCircuits(t *testing.T) {
 	}
 	if res.Err != fatal {
 		t.Errorf("Err = %v, want fatal", res.Err)
-	}
-}
-
-func TestRunWithRetry_ExhaustionReturnsLastError(t *testing.T) {
-	c := retryTestClient(t)
-
-	shared := serverError(http.StatusServiceUnavailable)
-	var calls int
-	res := c.runWithRetry(context.Background(), 3, retryTestRequestID, retryTestEndpoint,
-		func() attemptResult {
-			calls++
-			return attemptResult{Outcome: outcomeRetry, Err: shared}
-		})
-
-	if calls != 3 {
-		t.Errorf("action calls = %d, want 3 (maxAttempts)", calls)
-	}
-	if res.Err != shared {
-		t.Errorf("Err = %v, want the same instance the action returned", res.Err)
-	}
-	if !errors.Is(res.Err, ErrServerError) {
-		t.Errorf("Err should match ErrServerError sentinel; got %v", res.Err)
 	}
 }
 

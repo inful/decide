@@ -5,6 +5,9 @@ import (
 	"errors"
 	"math"
 	"math/rand/v2"
+	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -60,10 +63,46 @@ func (p RetryPolicy) nextDelay(attempt int) time.Duration {
 // We retry rate limiting (429) and the standard transient server failures.
 func isRetryableStatus(code int) bool {
 	switch code {
-	case httpTooManyRequests, httpInternalServerError, httpBadGateway, httpServiceUnavailable, httpGatewayTimeout:
+	case http.StatusTooManyRequests, http.StatusInternalServerError,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return true
 	}
 	return false
+}
+
+// parseRetryAfter reads a Retry-After header. Servers use either a count of
+// seconds or an HTTP date.
+//
+// Returns 0 when the header is absent, unparseable, or asks for a wait of
+// zero or less — the caller then falls back to the computed backoff. Waits
+// longer than maxRetryAfter are clamped so one request can never pin a
+// goroutine for minutes.
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	var d time.Duration
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		if secs > int(maxRetryAfter/time.Second) {
+			return maxRetryAfter
+		}
+		d = time.Duration(secs) * time.Second
+	} else if t, err := http.ParseTime(v); err == nil {
+		d = time.Until(t)
+		if d <= 0 {
+			return 0
+		}
+	} else {
+		return 0
+	}
+	if d > maxRetryAfter {
+		d = maxRetryAfter
+	}
+	return d
 }
 
 // isContextErr reports whether the error (or anything it wraps) is a context
@@ -71,13 +110,3 @@ func isRetryableStatus(code int) bool {
 func isContextErr(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
-
-// Status code constants duplicated from net/http so we can keep retry.go
-// dependency-free in spirit (no need to import net/http here).
-const (
-	httpTooManyRequests       = 429
-	httpInternalServerError   = 500
-	httpBadGateway            = 502
-	httpServiceUnavailable    = 503
-	httpGatewayTimeout        = 504
-)

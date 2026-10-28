@@ -41,6 +41,17 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: gofmt
+        # golangci-lint v2 does not check formatting by default, so the repo
+        # can drift out of gofmt without CI noticing. Keep it formatted.
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean; run 'gofmt -w .':"
+            echo "$unformatted"
+            exit 1
+          fi
+
       - name: go test
         run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
 

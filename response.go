@@ -10,8 +10,9 @@ type Response struct {
 	requestID string `json:"-"`
 }
 
-// RequestID returns the X-Request-ID echoed (or freshly minted) by the server.
-// Empty when the server did not include the header.
+// RequestID returns the X-Request-ID echoed by the server. When the server
+// does not echo it, this is the ID the client sent, so the caller always
+// gets the ID it can correlate on.
 func (r *Response) RequestID() string {
 	if r == nil {
 		return ""
