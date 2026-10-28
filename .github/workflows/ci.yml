@@ -29,9 +29,10 @@ jobs:
           # Use the version declared in go.mod so the CI matches the
           # project's stated minimum; bumping go.mod bumps CI automatically.
           go-version-file: go.mod
-          # No module cache: this package has no dependencies, so there is
-          # no go.sum for setup-go to hash and the cache never restores
-          # anything.
+          # setup-go's module cache defaults to on, but this package has
+          # no dependencies, so there is no go.sum for it to hash and the
+          # cache never restores anything.
+          cache: false
 
       - name: go mod tidy (check)
         # Catches a forgotten `go mod tidy` before tests run.
@@ -76,6 +77,10 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.22.x'
+          # setup-go's module cache defaults to on, but this package has
+          # no dependencies, so there is no go.sum for it to hash and the
+          # cache never restores anything.
+          cache: false
 
       - name: build the library on the oldest supported Go
         # The README promises the library itself works on Go 1.22. The
@@ -96,6 +101,10 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
+          # setup-go's module cache defaults to on, but this package has
+          # no dependencies, so there is no go.sum for it to hash and the
+          # cache never restores anything.
+          cache: false
 
       # Pin to the same golangci-lint major used locally. golangci-lint-action
       # v6 only handles golangci-lint v1.x; for v2.x we need v7 of the action.

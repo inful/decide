@@ -31,9 +31,10 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
-          # No module cache: this package has no dependencies, so there is
-          # no go.sum for setup-go to hash and the cache never restores
-          # anything.
+          # setup-go's module cache defaults to on, but this package has
+          # no dependencies, so there is no go.sum for it to hash and the
+          # cache never restores anything.
+          cache: false
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
