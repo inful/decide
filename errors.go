@@ -24,11 +24,18 @@ var (
 // HTTP method/URL/status and the response body (truncated to ~512 bytes in
 // the formatted message) so callers can log or inspect failure context.
 type Error struct {
+	// StatusCode is the HTTP status of the response. It is 0 when no
+	// response was received, and it can be a 2xx status on an error when
+	// the response arrived but could not be read (see
+	// ErrResponseDecoded and ErrResponseTooLarge). Use errors.Is to tell
+	// success from failure, not the status code.
 	StatusCode int
 	Status     string
 	Method     string
 	URL        string
-	Body       string
+	// Body is the start of the response body, up to errorBodyKeep bytes.
+	// It is a diagnostic aid, not the whole body.
+	Body string
 
 	// sentinel is the package-level Err* matching the status code.
 	sentinel error
@@ -82,6 +89,10 @@ func (e *Error) IsRetryable() bool {
 	if e == nil {
 		return false
 	}
+	if e.sentinel == ErrBadRequest {
+		// A malformed request fails the same way every time.
+		return false
+	}
 	if e.StatusCode == 0 {
 		// Transport errors are retryable; context errors are filtered earlier.
 		return true
@@ -91,12 +102,18 @@ func (e *Error) IsRetryable() bool {
 
 // newHTTPError wraps an HTTP response with the request context.
 func newHTTPError(method, url string, resp *http.Response, body []byte) *Error {
+	// The body is only there for diagnostics, so keep a short prefix
+	// rather than holding a megabyte per failed call.
+	kept := body
+	if len(kept) > errorBodyKeep {
+		kept = append(kept[:errorBodyKeep:errorBodyKeep], "...(truncated)"...)
+	}
 	return &Error{
 		StatusCode: resp.StatusCode,
 		Status:     resp.Status,
 		Method:     method,
 		URL:        url,
-		Body:       string(body),
+		Body:       string(kept),
 		sentinel:   sentinelForStatus(resp.StatusCode),
 	}
 }

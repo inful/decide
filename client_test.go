@@ -325,6 +325,94 @@ func TestClient_BaseURLValidation(t *testing.T) {
 	}
 }
 
+func TestClient_ResolvesEndpointOnceAtConstruction(t *testing.T) {
+	c := New("https://example.test/")
+	if c.endpoint != "https://example.test/v1/systemone" {
+		t.Errorf("endpoint = %q, want %q", c.endpoint, "https://example.test/v1/systemone")
+	}
+	if c.resolveErr != nil {
+		t.Errorf("resolveErr = %v, want nil", c.resolveErr)
+	}
+}
+
+func TestClient_InvalidBaseURLIsReportedAtCallTime(t *testing.T) {
+	c := New("not-a-url")
+	if c.resolveErr == nil {
+		t.Fatal("New should have recorded the resolve error")
+	}
+	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
+	if err == nil {
+		t.Fatal("expected SystemOne to report the bad base URL")
+	}
+}
+
+func TestClient_SystemOne_InvalidRequestIDFailsFast(t *testing.T) {
+	// A request ID with a newline cannot be sent as a header. The client
+	// must say so instead of failing every attempt as a transport error.
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		_, _ = w.Write([]byte(responseFixture))
+	}))
+	t.Cleanup(srv.Close)
+
+	ctx := WithContextRequestID(context.Background(), "bad\nvalue")
+	c := New(srv.URL, WithToken("sk"))
+	_, err := c.SystemOne(ctx, Request{State: State{Body: "hi"}})
+
+	if err == nil {
+		t.Fatal("expected an error for an invalid request ID")
+	}
+	if !errors.Is(err, ErrBadRequest) {
+		t.Errorf("err should match ErrBadRequest; got %v", err)
+	}
+	if attempts.Load() != 0 {
+		t.Errorf("server saw %d attempts, want 0 (the request must not be sent)", attempts.Load())
+	}
+	if strings.Contains(err.Error(), "transport") {
+		t.Errorf("error should name the real cause, not a transport failure; got %v", err)
+	}
+	e, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("expected *Error, got %T", err)
+	}
+	if e.IsRetryable() {
+		t.Error("an invalid request ID is not retryable")
+	}
+}
+
+func TestClient_SystemOne_LargeErrorBodyIsTrimmed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(strings.Repeat("x", 512<<10))) // 512 KiB
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"), WithRetries(0))
+	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
+	e, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("expected *Error, got %T", err)
+	}
+	if len(e.Body) > errorBodyKeep+len("...(truncated)") {
+		t.Errorf("Error.Body is %d bytes, want at most %d", len(e.Body), errorBodyKeep)
+	}
+}
+
+func TestRequestIDFromContext_NilContext(t *testing.T) {
+	//nolint:staticcheck // deliberately exercising the nil-context guard
+	if got := RequestIDFromContext(nil); got != "" {
+		t.Errorf("RequestIDFromContext(nil) = %q, want %q", got, "")
+	}
+}
+
+func TestWithRetries_NegativeKeepsTheDefault(t *testing.T) {
+	c := New("https://example.test", WithRetries(-1))
+	if c.retry.MaxRetries != DefaultRetryPolicy().MaxRetries {
+		t.Errorf("MaxRetries = %d, want the default %d", c.retry.MaxRetries, DefaultRetryPolicy().MaxRetries)
+	}
+}
+
 func TestClient_SystemOne_RequestIDFallsBackToSentID(t *testing.T) {
 	// The server does not echo X-Request-ID. The response must still carry
 	// the ID the client sent, so the caller can always correlate.

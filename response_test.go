@@ -117,6 +117,14 @@ func TestAnswer_NonDiscriminatorFieldsDontLeakBetweenTypes(t *testing.T) {
 	}
 }
 
+func TestResponse_RequestIDOnNilResponse(t *testing.T) {
+	// RequestID is documented as safe on a nil receiver.
+	var r *Response
+	if got := r.RequestID(); got != "" {
+		t.Errorf("RequestID() on a nil Response = %q, want %q", got, "")
+	}
+}
+
 func floatEq(a, b float64) bool {
 	return math.Abs(a-b) < 1e-9
 }

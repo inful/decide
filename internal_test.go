@@ -129,8 +129,7 @@ func TestResolve_RejectsEmptyAndInvalidBaseURL(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			client := New(tc.baseURL)
-			_, err := client.resolve("/v1/systemone")
+			_, err := resolveURL(tc.baseURL, "/v1/systemone")
 			if tc.wantErr && err == nil {
 				t.Errorf("expected error for %q", tc.baseURL)
 			}

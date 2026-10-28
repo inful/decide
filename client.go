@@ -26,9 +26,14 @@ const requestIDHeader = "X-Request-ID"
 // memory; responses beyond this are not a server contract we promise to honor.
 const responseBodyCap = 8 << 20 // 8 MiB
 
-// errorBodyCap caps how much of a non-2xx response body is kept for the
-// error message. Error bodies are diagnostics, not data we promise to return.
+// errorBodyCap caps how much of a non-2xx response body is read from the
+// wire. Reading the whole body is what lets the connection be reused.
 const errorBodyCap = 1 << 20 // 1 MiB
+
+// errorBodyKeep caps how much of that body is kept in Error.Body. The body
+// is a diagnostic aid, so a few KB is plenty and it keeps a failed call from
+// holding a megabyte.
+const errorBodyKeep = 4 << 10 // 4 KiB
 
 // maxRetryAfter caps how long the client will honor a server's Retry-After
 // header. Longer waits fall back to the normal backoff, so one request can
@@ -63,6 +68,8 @@ func newTransport(base http.RoundTripper) *http.Transport {
 // with functional Options. A Client is safe for concurrent use.
 type Client struct {
 	baseURL    string
+	endpoint   string
+	resolveErr error
 	token      string
 	httpClient *http.Client
 	retry      RetryPolicy
@@ -76,6 +83,9 @@ type Option func(*Client)
 // New returns a Client pointing at baseURL. The baseURL should be the scheme +
 // host (e.g. "https://api.example.com"); the SystemOne path is appended
 // automatically.
+//
+// A baseURL that cannot be turned into an endpoint is not rejected here — New
+// does not return an error. The problem is reported by the first call.
 func New(baseURL string, opts ...Option) *Client {
 	c := &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
@@ -87,6 +97,8 @@ func New(baseURL string, opts ...Option) *Client {
 		opt(c)
 	}
 	c.logger = newLoggerOrDiscard(c.logger)
+	// The endpoint never changes, so build it once instead of on every call.
+	c.endpoint, c.resolveErr = resolveURL(c.baseURL, systemOnePath)
 	return c
 }
 
@@ -161,9 +173,29 @@ func WithContextRequestID(ctx context.Context, id string) context.Context {
 }
 
 // RequestIDFromContext returns the request ID stored in ctx, or "" if none.
+// A nil context yields "".
 func RequestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
 	v, _ := ctx.Value(requestIDKey).(string)
 	return v
+}
+
+// validHeaderValue reports whether v is safe to use as an HTTP header value.
+// Go's transport rejects control characters, so we catch them here instead of
+// letting every attempt fail with a transport error.
+func validHeaderValue(v string) bool {
+	for i := 0; i < len(v); i++ {
+		b := v[i]
+		if b == '\t' {
+			continue
+		}
+		if b < 0x20 || b == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // newLoggerOrDiscard returns l, or a logger that drops everything if l is
@@ -265,9 +297,11 @@ func (c *Client) runWithRetry(
 				"endpoint", endpoint,
 				"request_id", requestID,
 			)
+			timer := time.NewTimer(delay)
 			select {
-			case <-time.After(delay):
+			case <-timer.C:
 			case <-ctx.Done():
+				timer.Stop()
 				return attemptResult{
 					Outcome: outcomeFatal,
 					Err:     wrapTransportError(http.MethodPost, endpoint, ctx.Err()),
@@ -336,10 +370,10 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	endpoint, err := c.resolve(systemOnePath)
-	if err != nil {
-		return nil, err
+	if c.resolveErr != nil {
+		return nil, c.resolveErr
 	}
+	endpoint := c.endpoint
 
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -349,6 +383,19 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 	requestID := RequestIDFromContext(ctx)
 	if requestID == "" {
 		requestID = c.requestID()
+	}
+	// A request ID with a control character cannot be sent as a header.
+	// Catch it here, with a message that names the cause, instead of
+	// letting the HTTP transport fail every attempt.
+	if !validHeaderValue(requestID) {
+		return nil, &Error{
+			StatusCode: 0,
+			Status:     "invalid request ID",
+			Method:     http.MethodPost,
+			URL:        endpoint,
+			Body:       "the request ID contains a character that cannot be sent in an HTTP header",
+			sentinel:   ErrBadRequest,
+		}
 	}
 
 	c.logger.Debug("systemone: sending request",
@@ -456,16 +503,18 @@ func (c *Client) decodeResponse(httpResp *http.Response, sentRequestID string) (
 	return &resp, nil
 }
 
-func (c *Client) resolve(path string) (string, error) {
-	if c.baseURL == "" {
+// resolveURL turns a base URL and a path into the full endpoint. The base
+// URL should be the scheme + host; the path is appended.
+func resolveURL(baseURL, path string) (string, error) {
+	if baseURL == "" {
 		return "", errors.New("decide: base URL is empty")
 	}
-	u, err := url.Parse(c.baseURL)
+	u, err := url.Parse(baseURL)
 	if err != nil {
-		return "", fmt.Errorf("decide: parse base URL %q: %w", c.baseURL, err)
+		return "", fmt.Errorf("decide: parse base URL %q: %w", baseURL, err)
 	}
 	if u.Scheme == "" || u.Host == "" {
-		return "", fmt.Errorf("decide: base URL %q must include scheme and host", c.baseURL)
+		return "", fmt.Errorf("decide: base URL %q must include scheme and host", baseURL)
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + path
 	return u.String(), nil
@@ -478,9 +527,6 @@ func (c *Client) resolve(path string) (string, error) {
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
-	}
-	if n <= 0 {
-		return ""
 	}
 	cut := n
 	for cut > 0 && !utf8.RuneStart(s[cut]) {

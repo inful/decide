@@ -12,7 +12,9 @@ and instructions. See the [example exchange](#example-exchange) below.
 go get github.com/inful/decide
 ```
 
-Go 1.22+ is sufficient; the module declares Go 1.26.
+Go 1.22+ is sufficient for the library; the module declares Go 1.26. The
+tests use `t.Context()` and need Go 1.24+. CI builds the library on Go 1.22
+to keep that promise honest.
 
 ## Quick start
 
@@ -83,7 +85,10 @@ case err != nil:
 ```
 
 `*decide.Error` also exposes `StatusCode`, `Status`, `Method`, `URL`, and `Body`
-for logging.
+for logging. `Body` holds the start of the response body, up to 4 KiB. Use
+`errors.Is` to tell success from failure — `StatusCode` is the status on the
+wire, so it can be a 2xx on an error when the response arrived but could not
+be read.
 
 ## Retries
 
@@ -106,6 +111,11 @@ instead of its own backoff, so a rate limit that clears in a few seconds is
 not turned into a failure. Waits longer than 30 s are capped at 30 s, so one
 request can never block for minutes; set a context deadline if you need a
 different bound.
+
+A single call can take a long time when the server keeps asking you to wait:
+each attempt has a 60 s timeout and each wait between attempts is up to 30 s,
+so the default 4 attempts can run for about five and a half minutes. Set a
+context deadline if that is too long.
 
 ## Logging
 
@@ -145,6 +155,9 @@ ctx = decide.WithContextRequestID(ctx, upstreamReqID())
 resp, err := client.SystemOne(ctx, req)
 // resp.RequestID() == upstreamReqID()
 ```
+
+An ID containing a character that cannot go in an HTTP header (a newline,
+say) is rejected before anything is sent, and reported as `ErrBadRequest`.
 
 Or supply your own generator:
 

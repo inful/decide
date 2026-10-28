@@ -63,6 +63,26 @@ jobs:
           path: coverage.out
           retention-days: 7
 
+  build-min-go:
+    name: build with the minimum Go we claim
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+
+      - name: build the library on the oldest supported Go
+        # The README promises the library itself works on Go 1.22. The
+        # tests use t.Context(), which needs Go 1.24, so this job builds
+        # only. GOTOOLCHAIN=local stops Go from downloading the newer
+        # toolchain that go.mod asks for. The rewrite avoids sed -i so the
+        # same command works with GNU and BSD sed.
+        run: |
+          sed 's/^go .*/go 1.22/' go.mod > go.mod.new && mv go.mod.new go.mod
+          GOTOOLCHAIN=local go build ./...
+
   lint:
     name: lint
     runs-on: ubuntu-latest
