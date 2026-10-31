@@ -50,19 +50,45 @@ if dept := resp.Answers["department"]; dept.IsChoice() && dept.ChoiceKey() == "b
 
 ## Question types
 
-Only two types are modeled today:
+Three types are modeled today:
 
-| Type    | Constructor                       | Response fields           |
-|---------|-----------------------------------|---------------------------|
-| choice  | `NewChoice(instr, criteria)`      | `Choice`, `Probabilities` |
-| noul    | `NewNoul(instr)`                  | `Noul` (a `[0,1]` prob)   |
+| Type    | Constructor                       | Response fields                    |
+|---------|-----------------------------------|------------------------------------|
+| choice  | `NewChoice(instr, criteria)`      | `Choice`, `Probabilities`, `Confidence` |
+| score   | `NewScore(instr, levels)`         | `Score`, `Legend`, `Probabilities`, `Confidence` |
+| noul    | `NewNoul(instr)`                  | `Noul` (a `[0,1]` prob)            |
 
-Both response types also carry:
+A `choice` question's criteria are an object mapping option keys to
+descriptions. A `score` question's are an ordered list of level descriptions,
+lowest first, and the answer is the expected level — it can land between two
+levels. The two shapes are sent differently, so `Question` marshals them
+itself; `NewScore` takes a `[]string` and sends it as an array.
 
-- `Confidence`, `AnswerConfidence` — model self-reported confidence
-- `Action.ActProbability` — how strongly the model thinks it should act on this answer
+### What the confidence numbers mean
 
-All questions share `Confidence`, `AnswerConfidence`, and `Action` regardless of type.
+They are not the same thing, and neither is "the chance the answer is right":
+
+- `Confidence` — how *concentrated* the answer's probabilities are, from 0 to 1.
+  It is `1 − H(p)/log k` over the option distribution, so a spread-out answer
+  scores low even when the top option leads.
+- `AnswerConfidence` — the top option's own probability.
+- `Action.ActProbability` — the model's act/escalate head. Upstream reports
+  it carries little signal, so **gate on `Confidence`**, not on this.
+
+Not every server sends every field. Ollama sends `Confidence` for choice and
+score answers but **no** `confidence` for a noul answer, and it sends neither
+`answer_confidence` nor `action` — those come back as zero. Use `NoulValue()`
+for a noul answer and treat a zero `Confidence` on a noul as "not reported",
+not as "no confidence".
+
+### Truncation is the server's call
+
+The server decides how much of your state it reads, and it may cut the rest
+without saying so. The English Laya checkpoint reads 512 tokens per question,
+so a long body is cut at that point. `Usage.Truncated` and `Usage.StateTokens`
+are only filled in by servers that report them — Ollama reports neither — so
+they come back false and zero even when the input *was* cut. Watch
+`Usage.InputTokens` against the server's budget if it matters.
 
 ## Errors
 
@@ -156,8 +182,8 @@ pool, proxy, or timeout settings.
 ## Running against a local model
 
 Ollama serves the same `/v1/systemone` endpoint, so this client talks to it
-directly. Ollama requires a `model` in the body; the hosted APIs let the
-server route the request instead.
+directly. Ollama requires a `model` in the body; servers that route requests
+themselves want none.
 
 ```bash
 ollama pull laya
@@ -170,6 +196,11 @@ client := decide.New("http://localhost:11434",
 )
 ```
 
+Set `WithModel` for Ollama and for Laya servers. Leave it unset for servers
+that route the request themselves — the hosted API treats a checkpoint name it
+does not know as "let the router choose", and a name that looks like a path
+is rejected.
+
 A model on the request overrides the client's default:
 
 ```go
@@ -179,6 +210,31 @@ resp, err := client.SystemOne(ctx, decide.Request{
     Questions: decide.Questions{"department": decide.NewChoice("Which team?", opts)},
 })
 ```
+
+### What the state can carry
+
+The API accepts a bare string or an object of any shape. This client sends an
+object with `body`, and optionally `subject` and `from` for mail triage:
+
+```go
+decide.State{
+    From:    "customer@acme.com",
+    Subject: "Duplicate billing on invoice #4411",
+    Body:    "We were billed twice for March.",
+}
+```
+
+The model reads the body on its own. The subject only matters when it carries
+signal the body does not — on a short body it can move the answer, on a long
+one it barely moves it.
+
+### Which checkpoint answered
+
+`Response.Routing` says which checkpoint answered and why, when the server
+reports it. It matters when the server has more than one: the English
+checkpoint reads Latin script only, so a request in another script can be
+answered by a checkpoint that cannot read it. Servers that use a single
+checkpoint do not report routing, and `Routing.Model` is then empty.
 
 ## Request IDs
 
@@ -279,19 +335,23 @@ WithLogger(Logger) Option
 WithRequestIDFunc(func() string) Option
 
 // Types
-State       { Body string }
-Question    { Type, Instructions string; Criteria map[string]string }
+State       { Body, Subject, From string }
+Question    { Type, Instructions string; Criteria map[string]string; Levels []string }
 NewChoice(instructions string, criteria map[string]string) Question
+NewScore(instructions string, levels []string) Question
 NewNoul(instructions string) Question
 Questions   map[string]Question
 Request     { Model, State, Questions }
 
-Response    { Model, Answers map[string]Answer, Usage; RequestID() }
-Answer      { Type, Choice, Probabilities, Noul, Confidence, AnswerConfidence, Action;
-              IsChoice(), IsNoul(), ChoiceKey(), NoulValue() }
+Response    { Model, Answers map[string]Answer, Usage, Routing; RequestID() }
+Answer      { Type, Choice, Probabilities, Noul, Score, Legend,
+              Confidence, AnswerConfidence, Action;
+              IsChoice(), IsNoul(), IsScore(),
+              ChoiceKey(), NoulValue(), ScoreValue(), ScoreLegend() }
 Action      { ActProbability }
 Usage       { InputTokens, OutputTokens, StateTokens, StateTokensDropped,
               Truncated, TruncatedQuestions }
+Routing     { Model, Repo, Reason }
 
 // Sentinels (match with errors.Is)
 ErrBadRequest, ErrUnauthorized, ErrForbidden, ErrNotFound,
@@ -312,7 +372,14 @@ RequestIDFromContext(ctx) string
 go test -race -count=1 ./...
 ```
 
-Coverage runs at ~95% of statements; the package has no transitive dependencies.
+Coverage runs at ~99% of statements; the package has no transitive dependencies.
+
+There is also a test that talks to a real decision server. It is skipped
+unless you point it at one:
+
+```
+DECIDE_TEST_URL=http://localhost:11434 DECIDE_TEST_MODEL=laya go test -run TestLive
+```
 
 ## Releasing
 
