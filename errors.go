@@ -132,6 +132,9 @@ func wrapTransportError(method, url string, err error) *Error {
 	}
 }
 
+// sentinelForStatus maps an HTTP status to the sentinel callers branch on
+// with errors.Is. Every status the API can return has one: a 4xx the caller
+// can fix is ErrBadRequest, a 5xx is ErrServerError.
 func sentinelForStatus(code int) error {
 	switch {
 	case code == http.StatusBadRequest:
@@ -146,6 +149,13 @@ func sentinelForStatus(code int) error {
 		return ErrRateLimited
 	case code >= 500:
 		return ErrServerError
+	case code >= 400:
+		// The remaining 4xx all mean "fix the request": 413 for a body over
+		// the server's limit, 415 for an unsupported encoding, 422 for a body
+		// that failed validation. Without this case they carried no sentinel
+		// at all, so errors.Is matched none of them and a caller could not
+		// tell "your request was too big" from a server fault.
+		return ErrBadRequest
 	}
 	return nil
 }

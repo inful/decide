@@ -5,7 +5,7 @@ type Response struct {
 	Model   string            `json:"model"`
 	Answers map[string]Answer `json:"answers"`
 	Usage   Usage             `json:"usage"`
-	Routing Routing           `json:"routing,omitempty"`
+	Routing Routing           `json:"routing"`
 
 	// requestID is captured from the X-Request-ID response header, if present.
 	requestID string `json:"-"`

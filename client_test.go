@@ -192,6 +192,80 @@ func TestClient_SystemOne_4xxReturnsTypedErrorNoRetry(t *testing.T) {
 	}
 }
 
+func TestClient_SystemOne_413IsABadRequest(t *testing.T) {
+	// A body over the server's limit comes back as 413. It has to carry a
+	// sentinel, or errors.Is matches nothing and the caller cannot tell
+	// "shrink your request" from a server fault.
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		http.Error(w, `{"error":"text and schema must not exceed 64 KiB"}`, http.StatusRequestEntityTooLarge)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"), WithRetries(5))
+	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
+
+	if err == nil {
+		t.Fatal("expected error for 413")
+	}
+	if !errors.Is(err, ErrBadRequest) {
+		t.Errorf("413 should match ErrBadRequest; got %v", err)
+	}
+	if errors.Is(err, ErrServerError) {
+		t.Errorf("413 should not match ErrServerError; got %v", err)
+	}
+	var httpErr *Error
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("expected a *Error, got %T", err)
+	}
+	if httpErr.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("StatusCode = %d, want 413", httpErr.StatusCode)
+	}
+	if httpErr.IsRetryable() {
+		t.Error("413 should not be retryable")
+	}
+	if attempts.Load() != 1 {
+		t.Errorf("attempts = %d, want exactly 1 (a smaller request is the fix)", attempts.Load())
+	}
+}
+
+func TestWithLongContext_SendsTheHeader(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get(longContextHeader)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(responseFixture))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"), WithLongContext())
+	if _, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}}); err != nil {
+		t.Fatalf("SystemOne: %v", err)
+	}
+	if got != "true" {
+		t.Errorf("%s = %q, want \"true\"", longContextHeader, got)
+	}
+}
+
+func TestWithLongContext_NotSentWhenUnset(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get(longContextHeader)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(responseFixture))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"))
+	if _, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}}); err != nil {
+		t.Fatalf("SystemOne: %v", err)
+	}
+	if got != "" {
+		t.Errorf("%s should be absent without WithLongContext; got %q", longContextHeader, got)
+	}
+}
+
 func TestClient_SystemOne_429Then200RetriesThenSucceeds(t *testing.T) {
 	var attempts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -10,7 +10,8 @@ import (
 )
 
 // ExampleClient_SystemOne shows the usual round trip: build a request with a
-// choice question and a noul question, call the API, and read the answers.
+// choice question, a score question and a noul question, call the API, and
+// read the answers.
 //
 // The httptest server stands in for the real API. Point decide.New at your
 // own host and drop the server.
@@ -26,6 +27,15 @@ func ExampleClient_SystemOne() {
 					"probabilities": {"billing": 0.9998, "technical": 0.0, "other": 0.0001},
 					"confidence": 0.9983,
 					"answer_confidence": 0.9998,
+					"action": {"act_probability": 1.0}
+				},
+				"urgency": {
+					"type": "score",
+					"score": 1.84,
+					"legend": {"0": "not urgent", "1": "soon", "2": "blocking"},
+					"probabilities": {"0": 0.02, "1": 0.12, "2": 0.86},
+					"confidence": 0.83,
+					"answer_confidence": 0.86,
 					"action": {"act_probability": 1.0}
 				},
 				"refund_requested": {
@@ -58,6 +68,10 @@ func ExampleClient_SystemOne() {
 					"other":     "everything else",
 				},
 			),
+			"urgency": decide.NewScore(
+				"How urgent is this?",
+				[]string{"not urgent", "soon", "blocking"},
+			),
 			"refund_requested": decide.NewNoul("Does the user request a refund?"),
 		},
 	})
@@ -67,11 +81,13 @@ func ExampleClient_SystemOne() {
 	}
 
 	fmt.Println("department:", resp.Answers["department"].ChoiceKey())
+	fmt.Println("urgency:", resp.Answers["urgency"].ScoreValue())
 	fmt.Println("refund requested:", resp.Answers["refund_requested"].NoulValue())
 	fmt.Println("request id:", resp.RequestID())
 
 	// Output:
 	// department: billing
+	// urgency: 1.84
 	// refund requested: 0.993
 	// request id: example-request-id
 }

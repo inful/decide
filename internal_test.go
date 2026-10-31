@@ -277,6 +277,9 @@ func TestErrorIs_DirectlyConstructedStatusMatchesSentinel(t *testing.T) {
 		{403, ErrForbidden},
 		{404, ErrNotFound},
 		{429, ErrRateLimited},
+		{413, ErrBadRequest},
+		{415, ErrBadRequest},
+		{422, ErrBadRequest},
 		{500, ErrServerError},
 		{502, ErrServerError},
 	}
