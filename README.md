@@ -12,9 +12,10 @@ and instructions. See the [example exchange](#example-exchange) below.
 go get github.com/inful/decide
 ```
 
-This module requires Go 1.22 or newer, and `go.mod` says so: a consumer on
-Go 1.22 can build it without a newer toolchain. CI builds and tests on Go
-1.22, the oldest supported version, and the release job uses the same.
+This module requires Go 1.26 or newer, and `go.mod` says so. A consumer on
+an older Go picks up the newer toolchain by itself; only a pinned
+`GOTOOLCHAIN=local` stops that. CI tests on Go 1.26, the version the module
+requires, and on the current stable release.
 
 ## Quick start
 
