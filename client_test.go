@@ -403,6 +403,67 @@ func TestClient_SystemOne_ErrorBodyReadFailureIsReported(t *testing.T) {
 	}
 }
 
+func TestWithModel_SendsModelInTheBody(t *testing.T) {
+	// Ollama requires a "model" field; the hosted APIs let the server route
+	// and take no model at all.
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &got)
+		_, _ = w.Write([]byte(responseFixture))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"), WithModel("laya"))
+	if _, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}}); err != nil {
+		t.Fatalf("SystemOne: %v", err)
+	}
+	if got["model"] != "laya" {
+		t.Errorf("body model = %v, want %q", got["model"], "laya")
+	}
+}
+
+func TestWithModel_NotSentWhenUnset(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &got)
+		_, _ = w.Write([]byte(responseFixture))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"))
+	if _, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}}); err != nil {
+		t.Fatalf("SystemOne: %v", err)
+	}
+	if _, present := got["model"]; present {
+		t.Errorf("body should not carry a model when none is set; got %v", got["model"])
+	}
+}
+
+func TestRequest_ModelOverridesTheClientDefault(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &got)
+		_, _ = w.Write([]byte(responseFixture))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"), WithModel("laya"))
+	_, err := c.SystemOne(context.Background(), Request{
+		Model:     "other-checkpoint",
+		State:     State{Body: "hi"},
+		Questions: Questions{"q": NewNoul("?")},
+	})
+	if err != nil {
+		t.Fatalf("SystemOne: %v", err)
+	}
+	if got["model"] != "other-checkpoint" {
+		t.Errorf("body model = %v, want %q", got["model"], "other-checkpoint")
+	}
+}
+
 func TestClient_BaseURLValidation(t *testing.T) {
 	if c := New(""); c.baseURL != "" {
 		t.Errorf("empty baseURL should be preserved (caller decides whether to use it)")
