@@ -12,9 +12,9 @@ and instructions. See the [example exchange](#example-exchange) below.
 go get github.com/inful/decide
 ```
 
-Go 1.22+ is sufficient for the library; the module declares Go 1.26. The
-tests use `t.Context()` and need Go 1.24+. CI builds the library on Go 1.22
-to keep that promise honest.
+This module requires Go 1.22 or newer, and `go.mod` says so: a consumer on
+Go 1.22 can build it without a newer toolchain. CI builds and tests on Go
+1.22, the oldest supported version, and the release job uses the same.
 
 ## Quick start
 
@@ -63,6 +63,10 @@ descriptions. A `score` question's are an ordered list of level descriptions,
 lowest first, and the answer is the expected level — it can land between two
 levels. The two shapes are sent differently, so `Question` marshals them
 itself; `NewScore` takes a `[]string` and sends it as an array.
+
+The client sends the instructions as text and the choice descriptions as
+strings. The API also accepts a structured instruction (an object or an
+array) and a `null` description; this client sends neither.
 
 ### What the confidence numbers mean
 
@@ -135,18 +139,26 @@ case err != nil:
 Every 4xx that is not 401, 403, 404 or 429 is `ErrBadRequest` — 413 for a body
 over the server's limit, 415 for an unsupported encoding, 422 for a body that
 failed validation. They all mean the same thing to a caller: fix the request.
+A redirect the client did not follow is `ErrBadRequest` too — the URL is
+wrong.
 
-`*decide.Error` also exposes `StatusCode`, `Status`, `Method`, `URL`, and `Body`
-for logging. `Body` holds the start of the response body, up to 4 KiB. Use
+`*decide.Error` also exposes `StatusCode`, `Status`, `Method`, `URL`, `Body`,
+`RequestID` and `RetryAfter` for logging. `Body` holds the start of the
+response body, up to 4 KiB. `RequestID` is the `X-Request-ID` the client
+sent, so a failure can be correlated with the server's log; it is empty when
+the request never left the client. `RetryAfter` is how long the server asked
+you to wait, from its `Retry-After` header — the client honours it on its
+own retries, and it is there for a caller that turned retries off. Use
 `errors.Is` to tell success from failure — `StatusCode` is the status on the
 wire, so it can be a 2xx on an error when the response arrived but could not
 be read.
 
 ## Retries
 
-By default the client retries 429/500/502/503/504 and transport errors with
-exponential backoff and ±20% jitter, capped at 5 s, for up to 4 attempts
-(initial + 3 retries). Tune via options:
+By default the client retries 429/500/502/503/504/529 and transport errors
+with exponential backoff and ±20% jitter, capped at 5 s, for up to 4 attempts
+(initial + 3 retries). 529 is the API's own overload status — as transient
+as a 503. Tune via options:
 
 ```go
 client := decide.New(baseURL,
@@ -204,6 +216,12 @@ host, which is too few for a client that talks to a single endpoint.
 
 Pass your own `*http.Client` with `WithHTTPClient` if you need different
 pool, proxy, or timeout settings.
+
+The client does not follow a redirect to a different host. Go re-sends the
+request body on a 307/308, and the body is your state — a customer's email, a
+ticket — so the text stays on the server you chose. A redirect to the same
+host and port is followed, so an http-to-https upgrade still works. A refused
+redirect comes back as an error with a 3xx `StatusCode`.
 
 ## Running against a local model
 
@@ -410,7 +428,8 @@ WithContextRequestID(ctx, id) context.Context
 RequestIDFromContext(ctx) string
 
 // Errors
-*Error      { StatusCode, Status, Method, URL, Body; IsRetryable(); Unwrap() }
+*Error      { StatusCode, Status, Method, URL, Body, RequestID, RetryAfter;
+              IsRetryable(); Unwrap() }
 ```
 
 ## Testing

@@ -61,6 +61,45 @@ func TestQuestionRoundTripKeepsBothCriteriaShapes(t *testing.T) {
 	}
 }
 
+func TestQuestionLevelsWinOverCriteria(t *testing.T) {
+	// Both fields set: the levels are sent, because a score question wants
+	// an array and a choice question wants an object.
+	q := Question{
+		Type:         "score",
+		Instructions: "How much?",
+		Criteria:     map[string]string{"0": "low", "1": "high"},
+		Levels:       []string{"low", "high"},
+	}
+
+	data, err := json.Marshal(q)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	want := `{"type":"score","instructions":"How much?","criteria":["low","high"]}`
+	if string(data) != want {
+		t.Errorf("got %s\nwant %s", data, want)
+	}
+}
+
+func TestQuestionUnmarshalRejectsNonStringLevels(t *testing.T) {
+	// A criteria array with a non-string element cannot become levels.
+	var q Question
+	err := json.Unmarshal([]byte(`{"type":"score","instructions":"?","criteria":["a",1]}`), &q)
+	if err == nil {
+		t.Error("expected an error for a criteria array with a non-string element")
+	}
+}
+
+func TestQuestionUnmarshalRejectsANonStringType(t *testing.T) {
+	// The JSON is well formed but does not fit the question shape.
+	var q Question
+	err := json.Unmarshal([]byte(`{"type":5,"instructions":"?"}`), &q)
+	if err == nil {
+		t.Error("expected an error for a non-string type")
+	}
+}
+
 func TestStateCarriesSubjectAndFrom(t *testing.T) {
 	// The API accepts an object state of any shape; subject and from are
 	// what make email triage work.

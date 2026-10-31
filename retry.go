@@ -57,12 +57,18 @@ func (p RetryPolicy) nextDelay(attempt int) time.Duration {
 	return time.Duration(base)
 }
 
+// statusOverloaded is the non-standard status the decision API uses for
+// "temporarily overloaded". It is documented next to 429 and is as transient.
+const statusOverloaded = 529
+
 // isRetryableStatus reports whether the given HTTP status warrants a retry.
-// We retry rate limiting (429) and the standard transient server failures.
+// We retry rate limiting (429), the standard transient server failures, and
+// the API's own overload status (529).
 func isRetryableStatus(code int) bool {
 	switch code {
 	case http.StatusTooManyRequests, http.StatusInternalServerError,
-		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout,
+		statusOverloaded:
 		return true
 	}
 	return false

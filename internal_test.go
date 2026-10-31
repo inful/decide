@@ -41,10 +41,13 @@ func TestDecodeResponse_LongMalformedBodyIsReported(t *testing.T) {
 
 func TestDecodeResponse_BodyReadFailureIsReported(t *testing.T) {
 	// The server promises more bytes than it sends and then drops the
-	// connection, so reading the body fails.
+	// connection, so reading the body fails after the response arrived.
+	// The headers are flushed first, or the server would discard them
+	// with the body and the failure would happen before the response.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "4096")
 		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
 		_, _ = w.Write([]byte(`{"model":"m"`))
 		panic(http.ErrAbortHandler)
 	}))
@@ -241,7 +244,7 @@ func TestDecodeResponse_MalformedJSONReturnsTypedError(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	c := New(srv.URL, WithToken("sk"))
-	_, decErr := c.SystemOne(t.Context(), Request{State: State{Body: "hi"}})
+	_, decErr := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 	if decErr == nil {
 		t.Fatal("expected error from malformed body")
 	}
@@ -258,7 +261,7 @@ func TestDecodeResponse_CapturesRequestIDFromResponseHeader(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	c := New(srv.URL, WithToken("sk"))
-	resp, err := c.SystemOne(t.Context(), Request{State: State{Body: "hi"}})
+	resp, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 	if err != nil {
 		t.Fatalf("SystemOne: %v", err)
 	}
@@ -280,8 +283,11 @@ func TestErrorIs_DirectlyConstructedStatusMatchesSentinel(t *testing.T) {
 		{413, ErrBadRequest},
 		{415, ErrBadRequest},
 		{422, ErrBadRequest},
+		{301, ErrBadRequest},
+		{307, ErrBadRequest},
 		{500, ErrServerError},
 		{502, ErrServerError},
+		{529, ErrServerError},
 	}
 	for _, c := range cases {
 		err := &Error{StatusCode: c.code}

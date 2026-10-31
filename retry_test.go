@@ -1,7 +1,6 @@
 package decide
 
 import (
-	"errors"
 	"testing"
 	"time"
 )
@@ -61,7 +60,7 @@ func TestRetryPolicyNextDelay_JitterStaysWithinBounds(t *testing.T) {
 }
 
 func TestIsRetryableStatus(t *testing.T) {
-	for _, code := range []int{429, 500, 502, 503, 504} {
+	for _, code := range []int{429, 500, 502, 503, 504, 529} {
 		if !isRetryableStatus(code) {
 			t.Errorf("%d should be retryable", code)
 		}
@@ -70,15 +69,5 @@ func TestIsRetryableStatus(t *testing.T) {
 		if isRetryableStatus(code) {
 			t.Errorf("%d should not be retryable", code)
 		}
-	}
-}
-
-func TestIsContextErrIsTerminal(t *testing.T) {
-	// A context-cancelled error must not be retried.
-	err := errors.New("context canceled")
-	if isContextErr(err) == false {
-		// Sentinel check; we just need to make sure the helper exists and
-		// recognizes a cancel-y message. The real check uses errors.Is.
-		t.Log("isContextErr exists")
 	}
 }

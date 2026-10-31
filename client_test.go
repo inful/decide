@@ -81,6 +81,14 @@ func TestNewRequestID_DefaultsToUUIDShape(t *testing.T) {
 	if strings.Count(id, "-") != 4 {
 		t.Errorf("UUID-shaped has %d dashes, want 4", strings.Count(id, "-"))
 	}
+	// RFC 4122: the version nibble is 4 and the variant nibble is one of
+	// 8, 9, a, b. Without these the ID only looks like a UUID.
+	if id[14] != '4' {
+		t.Errorf("version nibble = %q, want '4' (id %q)", id[14], id)
+	}
+	if v := id[19]; !strings.ContainsRune("89ab", rune(v)) {
+		t.Errorf("variant nibble = %q, want one of 89ab (id %q)", v, id)
+	}
 }
 
 func TestClient_SystemOne_HappyPath(t *testing.T) {
@@ -230,28 +238,84 @@ func TestClient_SystemOne_413IsABadRequest(t *testing.T) {
 	}
 }
 
-func TestWithLongContext_SendsTheHeader(t *testing.T) {
-	var got string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Get(longContextHeader)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
-
-	c := New(srv.URL, WithToken("sk"), WithLongContext())
-	if _, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}}); err != nil {
-		t.Fatalf("SystemOne: %v", err)
+func TestWithLongContext_Header(t *testing.T) {
+	cases := []struct {
+		name string
+		opts []Option
+		want string
+	}{
+		{"enabled", []Option{WithLongContext()}, "true"},
+		{"not enabled", nil, ""},
 	}
-	if got != "true" {
-		t.Errorf("%s = %q, want \"true\"", longContextHeader, got)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var got string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = r.Header.Get(longContextHeader)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(responseFixture))
+			}))
+			t.Cleanup(srv.Close)
+
+			client := New(srv.URL, append([]Option{WithToken("sk")}, c.opts...)...)
+			if _, err := client.SystemOne(context.Background(), Request{State: State{Body: "hi"}}); err != nil {
+				t.Fatalf("SystemOne: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("%s = %q, want %q", longContextHeader, got, c.want)
+			}
+		})
 	}
 }
 
-func TestWithLongContext_NotSentWhenUnset(t *testing.T) {
-	var got string
+func TestClient_SystemOne_RefusesACrossHostRedirect(t *testing.T) {
+	// The request body carries the caller's state. A 307 makes Go re-send
+	// it to the redirect target, so the client must not follow one that
+	// leaves the host the caller chose.
+	var gotBody string
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(responseFixture))
+	}))
+	t.Cleanup(other.Close)
+
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/v1/systemone", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(api.Close)
+
+	c := New(api.URL, WithToken("sk"))
+	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "secret customer text"}})
+
+	if err == nil {
+		t.Fatal("expected an error for a redirect to another host")
+	}
+	if !errors.Is(err, ErrBadRequest) {
+		t.Errorf("a refused redirect should match ErrBadRequest; got %v", err)
+	}
+	if gotBody != "" {
+		t.Errorf("the other host received the request body %q", gotBody)
+	}
+	var httpErr *Error
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("expected a *Error, got %T", err)
+	}
+	if httpErr.StatusCode != http.StatusTemporaryRedirect {
+		t.Errorf("StatusCode = %d, want 307", httpErr.StatusCode)
+	}
+}
+
+func TestClient_SystemOne_FollowsASameHostRedirect(t *testing.T) {
+	// A redirect that stays on the same host and port is fine.
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Get(longContextHeader)
+		if r.URL.Path == "/v1/systemone" {
+			http.Redirect(w, r, "/v2/systemone", http.StatusTemporaryRedirect)
+			return
+		}
+		hits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(responseFixture))
 	}))
@@ -261,8 +325,103 @@ func TestWithLongContext_NotSentWhenUnset(t *testing.T) {
 	if _, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}}); err != nil {
 		t.Fatalf("SystemOne: %v", err)
 	}
-	if got != "" {
-		t.Errorf("%s should be absent without WithLongContext; got %q", longContextHeader, got)
+	if hits.Load() != 1 {
+		t.Errorf("the redirect target was hit %d times, want 1", hits.Load())
+	}
+}
+
+func TestClient_SystemOne_ErrorCarriesTheRequestID(t *testing.T) {
+	// The ID is how a caller correlates a failure with the server's log,
+	// so it has to be on the error and not only in the client's log line.
+	var sent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sent = r.Header.Get("X-Request-ID")
+		http.Error(w, `{"error":"boom"}`, http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"), WithRetries(0))
+	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
+
+	if err == nil {
+		t.Fatal("expected an error for a 500")
+	}
+	var httpErr *Error
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("expected a *Error, got %T", err)
+	}
+	if httpErr.RequestID == "" {
+		t.Fatal("the error carries no request ID")
+	}
+	if httpErr.RequestID != sent {
+		t.Errorf("error RequestID = %q, want the ID that was sent %q", httpErr.RequestID, sent)
+	}
+}
+
+func TestClient_SystemOne_ErrorCarriesRetryAfter(t *testing.T) {
+	// A caller that turned retries off still needs to know how long the
+	// server asked it to wait.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "17")
+		http.Error(w, `{"error":"slow down"}`, http.StatusTooManyRequests)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"), WithRetries(0))
+	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
+
+	if err == nil {
+		t.Fatal("expected an error for a 429")
+	}
+	var httpErr *Error
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("expected a *Error, got %T", err)
+	}
+	if httpErr.RetryAfter != 17*time.Second {
+		t.Errorf("RetryAfter = %v, want 17s", httpErr.RetryAfter)
+	}
+}
+
+func TestClient_SystemOne_529IsRetried(t *testing.T) {
+	// 529 is the API's own overload status, as transient as a 503.
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) < 3 {
+			http.Error(w, `{"error":"overloaded"}`, 529)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(responseFixture))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"), WithRetries(3), WithBackoff(time.Millisecond, time.Millisecond))
+	if _, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}}); err != nil {
+		t.Fatalf("SystemOne: %v", err)
+	}
+	if got := attempts.Load(); got != 3 {
+		t.Errorf("attempts = %d, want 3 (two 529s then success)", got)
+	}
+}
+
+func TestClient_InvalidBaseURLReturnsTypedError(t *testing.T) {
+	// The README says SystemOne returns a *Response or an *Error. A bad
+	// base URL used to return a plain error, so errors.As found nothing.
+	c := New("not-a-url")
+	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
+
+	if err == nil {
+		t.Fatal("expected SystemOne to report the bad base URL")
+	}
+	var httpErr *Error
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("expected a *Error, got %T", err)
+	}
+	if !errors.Is(err, ErrBadRequest) {
+		t.Errorf("a bad base URL should match ErrBadRequest; got %v", err)
+	}
+	if httpErr.StatusCode != 0 {
+		t.Errorf("StatusCode = %d, want 0 (no response was received)", httpErr.StatusCode)
 	}
 }
 
