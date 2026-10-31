@@ -45,6 +45,24 @@ const errorBodyKeep = 4 << 10 // 4 KiB
 // never pin a goroutine for minutes on a hostile or buggy server.
 const maxRetryAfter = 30 * time.Second
 
+// refuseCrossHostRedirect stops the client from following a redirect to a
+// different host.
+//
+// Go re-sends the request body on a 307/308, and the body carries the
+// caller's state — a customer's email, a ticket, a chat log. Refusing the
+// hop keeps that text on the host the caller chose. The 3xx comes back as an
+// ordinary error so the caller can see it.
+//
+// The comparison includes the port: two servers on one machine are two
+// servers. A redirect to the same host and port is followed, so an
+// http-to-https upgrade still works.
+func refuseCrossHostRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) > 0 && !strings.EqualFold(req.URL.Host, via[0].URL.Host) {
+		return http.ErrUseLastResponse
+	}
+	return nil
+}
+
 // defaultTransport is the transport shared by every Client created without
 // WithHTTPClient.
 //
@@ -96,7 +114,7 @@ type Option func(*Client)
 func New(baseURL string, opts ...Option) *Client {
 	c := &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
-		httpClient: &http.Client{Transport: defaultTransport, Timeout: 60 * time.Second},
+		httpClient: &http.Client{Transport: defaultTransport, Timeout: 60 * time.Second, CheckRedirect: refuseCrossHostRedirect},
 		retry:      DefaultRetryPolicy(),
 		requestID:  newUUIDv4,
 	}
@@ -403,7 +421,16 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 		ctx = context.Background()
 	}
 	if c.resolveErr != nil {
-		return nil, c.resolveErr
+		// The base URL is the caller's mistake, so report it the way every
+		// other caller error is reported: as an *Error with a sentinel.
+		return nil, &Error{
+			StatusCode: 0,
+			Status:     "invalid base URL",
+			Method:     http.MethodPost,
+			URL:        c.baseURL,
+			Body:       c.resolveErr.Error(),
+			sentinel:   ErrBadRequest,
+		}
 	}
 	endpoint := c.endpoint
 
@@ -457,6 +484,7 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 		func() attemptResult {
 			httpResp, transportErr := c.do(ctx, http.MethodPost, endpoint, body, requestID)
 			if transportErr != nil {
+				transportErr.RequestID = requestID
 				return attemptResult{Outcome: outcomeRetry, Err: transportErr}
 			}
 			if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
@@ -465,6 +493,10 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 			respBody, readErr := io.ReadAll(io.LimitReader(httpResp.Body, errorBodyCap))
 			_ = httpResp.Body.Close()
 			httpErr := newHTTPError(http.MethodPost, endpoint, httpResp, respBody)
+			// Carry the correlation ID and the server's own idea of how long
+			// to wait, so a caller that gets this error can use both.
+			httpErr.RequestID = requestID
+			httpErr.RetryAfter = parseRetryAfter(httpResp.Header.Get("Retry-After"))
 			if readErr != nil {
 				httpErr.Body = fmt.Sprintf("%s (body read failed: %v)", httpErr.Body, readErr)
 			}
@@ -472,7 +504,7 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 				return attemptResult{
 					Outcome:    outcomeRetry,
 					Err:        httpErr,
-					RetryAfter: parseRetryAfter(httpResp.Header.Get("Retry-After")),
+					RetryAfter: httpErr.RetryAfter,
 				}
 			}
 			return attemptResult{Outcome: outcomeFatal, Err: httpErr}
@@ -518,7 +550,9 @@ func (c *Client) decodeResponse(httpResp *http.Response, sentRequestID string) (
 	// than silently cut into an unparseable prefix.
 	body, err := io.ReadAll(io.LimitReader(httpResp.Body, responseBodyCap+1))
 	if err != nil {
-		return nil, wrapTransportError(http.MethodPost, httpResp.Request.URL.String(), err)
+		transportErr := wrapTransportError(http.MethodPost, httpResp.Request.URL.String(), err)
+		transportErr.RequestID = sentRequestID
+		return nil, transportErr
 	}
 	if len(body) > responseBodyCap {
 		return nil, &Error{
@@ -527,6 +561,7 @@ func (c *Client) decodeResponse(httpResp *http.Response, sentRequestID string) (
 			Method:     http.MethodPost,
 			URL:        httpResp.Request.URL.String(),
 			Body:       fmt.Sprintf("response body exceeds the %d byte limit", responseBodyCap),
+			RequestID:  sentRequestID,
 			sentinel:   ErrResponseTooLarge,
 		}
 	}
@@ -546,6 +581,7 @@ func (c *Client) decodeResponse(httpResp *http.Response, sentRequestID string) (
 			Method:     http.MethodPost,
 			URL:        httpResp.Request.URL.String(),
 			Body:       fmt.Sprintf("decode error: %v; raw: %s", err, truncate(string(raw), 512)),
+			RequestID:  sentRequestID,
 			sentinel:   ErrResponseDecoded,
 		}
 	}

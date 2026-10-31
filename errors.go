@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 // Sentinel errors so callers can branch on categories with errors.Is.
@@ -36,6 +37,17 @@ type Error struct {
 	// Body is the start of the response body, up to errorBodyKeep bytes.
 	// It is a diagnostic aid, not the whole body.
 	Body string
+
+	// RequestID is the X-Request-ID the client sent, so a caller can
+	// correlate a failure with the server's log. It is empty when nothing
+	// was sent — a request rejected before it left the client.
+	RequestID string
+
+	// RetryAfter is how long the server asked the caller to wait, from the
+	// Retry-After header. It is zero when the server sent none. The client
+	// honours it on its own retries; a caller that turned retries off can
+	// use it to schedule its own.
+	RetryAfter time.Duration
 
 	// sentinel is the package-level Err* matching the status code.
 	sentinel error
@@ -137,6 +149,9 @@ func wrapTransportError(method, url string, err error) *Error {
 // can fix is ErrBadRequest, a 5xx is ErrServerError.
 func sentinelForStatus(code int) error {
 	switch {
+	case code >= 300 && code < 400:
+		// A redirect the client did not follow: the URL is wrong.
+		return ErrBadRequest
 	case code == http.StatusBadRequest:
 		return ErrBadRequest
 	case code == http.StatusUnauthorized:
