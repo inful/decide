@@ -125,6 +125,85 @@ func TestResponse_RequestIDOnNilResponse(t *testing.T) {
 	}
 }
 
+func TestAnswer_ScoreType(t *testing.T) {
+	payload := `{
+		"type": "score",
+		"score": 1.5757,
+		"legend": {"0": "Not urgent", "1": "Soon", "2": "Critical"},
+		"probabilities": {"0": 0.0812, "1": 0.2618, "2": 0.657},
+		"confidence": 0.2437
+	}`
+
+	var a Answer
+	if err := json.Unmarshal([]byte(payload), &a); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !a.IsScore() {
+		t.Fatalf("expected score type, got %q", a.Type)
+	}
+	if !floatEq(a.ScoreValue(), 1.5757) {
+		t.Errorf("score = %v, want 1.5757", a.ScoreValue())
+	}
+	legend := a.ScoreLegend()
+	if len(legend) != 3 || legend["2"] != "Critical" {
+		t.Errorf("legend = %#v", legend)
+	}
+	if a.Probabilities["2"] < 0.65 || a.Probabilities["2"] > 0.66 {
+		t.Errorf("p[2] = %v, want about 0.657", a.Probabilities["2"])
+	}
+}
+
+func TestAnswer_ScoreAccessorsAreSafeOnOtherTypes(t *testing.T) {
+	// A non-score answer must not leak a score or a legend.
+	noul := Answer{Type: "noul", Noul: 0.4, Score: 3, Legend: map[string]string{"0": "x"}}
+	if noul.IsScore() {
+		t.Errorf("noul.IsScore should be false")
+	}
+	if got := noul.ScoreValue(); got != 0 {
+		t.Errorf("ScoreValue() = %v, want 0", got)
+	}
+	if got := noul.ScoreLegend(); got != nil {
+		t.Errorf("ScoreLegend() = %#v, want nil", got)
+	}
+}
+
+func TestResponseRouting(t *testing.T) {
+	payload := `{
+		"model": "laya-rl-agent",
+		"answers": {},
+		"usage": {},
+		"routing": {
+			"model": "english",
+			"repo": "convaiinnovations/laya",
+			"reason": "English Latin text"
+		}
+	}`
+
+	var r Response
+	if err := json.Unmarshal([]byte(payload), &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if r.Routing.Model != "english" {
+		t.Errorf("routing.model = %q, want %q", r.Routing.Model, "english")
+	}
+	if r.Routing.Repo != "convaiinnovations/laya" {
+		t.Errorf("routing.repo = %q", r.Routing.Repo)
+	}
+	if r.Routing.Reason != "English Latin text" {
+		t.Errorf("routing.reason = %q", r.Routing.Reason)
+	}
+}
+
+func TestResponseRoutingEmptyWhenNotReported(t *testing.T) {
+	var r Response
+	if err := json.Unmarshal([]byte(`{"model":"laya"}`), &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if r.Routing.Model != "" {
+		t.Errorf("routing.model = %q, want empty when the server does not report it", r.Routing.Model)
+	}
+}
+
 func floatEq(a, b float64) bool {
 	return math.Abs(a-b) < 1e-9
 }

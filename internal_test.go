@@ -14,6 +14,52 @@ import (
 	"unicode/utf8"
 )
 
+func TestDecodeResponse_LongMalformedBodyIsReported(t *testing.T) {
+	// A body that does not parse and is longer than the 512 bytes kept for
+	// the message still reports the decode failure, with the raw prefix.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("not json ", 200)))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"))
+	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
+	if err == nil {
+		t.Fatal("expected a decode error")
+	}
+	if !errors.Is(err, ErrResponseDecoded) {
+		t.Errorf("err should match ErrResponseDecoded; got %v", err)
+	}
+	e, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("expected *Error, got %T", err)
+	}
+	if !strings.Contains(e.Body, "decode error") {
+		t.Errorf("Error.Body should mention the decode failure; got %q", e.Body)
+	}
+}
+
+func TestDecodeResponse_BodyReadFailureIsReported(t *testing.T) {
+	// The server promises more bytes than it sends and then drops the
+	// connection, so reading the body fails.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "4096")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"model":"m"`))
+		panic(http.ErrAbortHandler)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithToken("sk"), WithRetries(0))
+	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
+	if err == nil {
+		t.Fatal("expected an error when the body cannot be read")
+	}
+	if !errors.Is(err, ErrTransport) {
+		t.Errorf("err should match ErrTransport; got %v", err)
+	}
+}
+
 func TestTruncate(t *testing.T) {
 	if got := truncate("hello", 10); got != "hello" {
 		t.Errorf("short string untouched; got %q", got)

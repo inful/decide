@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # The workflows pin Actions by commit SHA, so a moving tag cannot change
+  # what runs. Dependabot is what moves those pins forward.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
