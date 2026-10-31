@@ -90,6 +90,28 @@ are only filled in by servers that report them — Ollama reports neither — so
 they come back false and zero even when the input *was* cut. Watch
 `Usage.InputTokens` against the server's budget if it matters.
 
+### The request has a size limit too
+
+The server caps the request body and answers a bigger one with **413**. Ollama
+caps it at 64 KiB; the hosted API at 32 MiB. The client sends what you give it
+and does not check the size itself, so an oversized request comes back as an
+error — `ErrBadRequest`, because a smaller request is the fix.
+
+The context window is a separate limit, and the way to raise it is a header
+rather than a body field. The hosted API reads 64k tokens per request by
+default and 262k with the long-context header set, so a state that does not
+fit needs it:
+
+```go
+client := decide.New(baseURL,
+    decide.WithToken(token),
+    decide.WithLongContext(),
+)
+```
+
+The larger window is billed per token, so it costs more per request. Servers
+that do not know the header — Ollama, Laya's own server — ignore it.
+
 ## Errors
 
 `Client.SystemOne` returns either a `*decide.Response` or a `*decide.Error`. Use
@@ -98,7 +120,7 @@ they come back false and zero even when the input *was* cut. Watch
 ```go
 _, err := client.SystemOne(ctx, req)
 switch {
-case errors.Is(err, decide.ErrBadRequest):     // 400 — fix the request
+case errors.Is(err, decide.ErrBadRequest):     // 4xx — fix the request
 case errors.Is(err, decide.ErrUnauthorized):   // 401 — check the token
 case errors.Is(err, decide.ErrRateLimited):    // 429 — back off (already retried)
 case errors.Is(err, decide.ErrServerError):    // 5xx — back off (already retried)
@@ -109,6 +131,10 @@ case err != nil:
     return err
 }
 ```
+
+Every 4xx that is not 401, 403, 404 or 429 is `ErrBadRequest` — 413 for a body
+over the server's limit, 415 for an unsupported encoding, 422 for a body that
+failed validation. They all mean the same thing to a caller: fix the request.
 
 `*decide.Error` also exposes `StatusCode`, `Status`, `Method`, `URL`, and `Body`
 for logging. `Body` holds the start of the response body, up to 4 KiB. Use
@@ -224,9 +250,10 @@ decide.State{
 }
 ```
 
-The model reads the body on its own. The subject only matters when it carries
-signal the body does not — on a short body it can move the answer, on a long
-one it barely moves it.
+The model reads the body on its own. The subject matters whenever the body does
+not carry the signal, whatever the body's length: on a body that says nothing
+about the intent, adding the subject moved the answer from a 0.13-confidence
+guess to 0.96. On a body that already says it, the subject changes little.
 
 ### Which checkpoint answered
 
@@ -284,6 +311,11 @@ X-Request-ID: 81f778ef-133d-41c9-99f6-f47417675689
         "other":     "everything else"
       }
     },
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is this?",
+      "criteria": ["not urgent", "soon", "blocking"]
+    },
     "refund_requested": {
       "type": "noul",
       "instructions": "Does the user request a refund?"
@@ -306,6 +338,15 @@ Response:
       "answer_confidence": 0.9998,
       "action": {"act_probability": 1.0}
     },
+    "urgency": {
+      "type": "score",
+      "score": 1.84,
+      "legend": {"0": "not urgent", "1": "soon", "2": "blocking"},
+      "probabilities": {"0": 0.02, "1": 0.12, "2": 0.86},
+      "confidence": 0.83,
+      "answer_confidence": 0.86,
+      "action": {"act_probability": 1.0}
+    },
     "refund_requested": {
       "type": "noul",
       "noul": 0.993,
@@ -313,6 +354,11 @@ Response:
       "answer_confidence": 0.993,
       "action": {"act_probability": 1.0}
     }
+  },
+  "routing": {
+    "model": "english",
+    "repo": "convaiinnovations/laya",
+    "reason": "Latin script; the English checkpoint reads it"
   },
   "usage": {
     "input_tokens": 105, "output_tokens": 0, "state_tokens": 20,
@@ -328,6 +374,7 @@ Response:
 New(baseURL string, opts ...Option) *Client
 WithToken(string) Option
 WithModel(string) Option
+WithLongContext() Option
 WithHTTPClient(*http.Client) Option
 WithRetries(int) Option
 WithBackoff(initial, max time.Duration) Option

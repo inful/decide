@@ -29,7 +29,7 @@ type Question struct {
 
 	// Levels holds the ordered level descriptions of a "score" question,
 	// lowest first. It is sent as the "criteria" field; Criteria is used
-	// for every other type.
+	// for every other type. If both are set, Levels wins.
 	Levels []string `json:"-"`
 }
 

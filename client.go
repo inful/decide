@@ -22,6 +22,11 @@ const systemOnePath = "/v1/systemone"
 // directions: outgoing requests set it, incoming responses may echo it.
 const requestIDHeader = "X-Request-ID"
 
+// longContextHeader is the hosted API's opt-in header that raises the
+// per-request and per-question context limits. Servers that do not know it
+// ignore it.
+const longContextHeader = "TypeSafe-Danger-Zone-Long-Context"
+
 // responseBodyCap caps the size of a response body the client will read into
 // memory; responses beyond this are not a server contract we promise to honor.
 const responseBodyCap = 8 << 20 // 8 MiB
@@ -76,6 +81,7 @@ type Client struct {
 	retry      RetryPolicy
 	logger     Logger
 	requestID  func() string
+	longCtx    bool
 }
 
 // Option mutates a Client during construction.
@@ -125,6 +131,21 @@ func WithHTTPClient(hc *http.Client) Option {
 			c.httpClient = hc
 		}
 	}
+}
+
+// WithLongContext asks the server for its larger context window.
+//
+// The hosted decision API reads at most 64k tokens per request by default,
+// and 262k with this header set. A state longer than the default window is
+// truncated without a warning, so a long document needs it.
+//
+// The larger window is billed per token, so it costs more per request. Servers
+// that do not know the header — Ollama, Laya's own server — ignore it.
+//
+// This is a client-wide setting. Use a second client for the long-document
+// calls if you do not want every request to pay for it.
+func WithLongContext() Option {
+	return func(c *Client) { c.longCtx = true }
 }
 
 // WithRetries sets the maximum number of retries after the initial attempt.
@@ -476,6 +497,12 @@ func (c *Client) do(ctx context.Context, method, url string, body []byte, reques
 		httpReq.Header.Set("Authorization", "Bearer "+c.token)
 	}
 	httpReq.Header.Set(requestIDHeader, requestID)
+	if c.longCtx {
+		// Go canonicalises header names, so the wire carries
+		// "Typesafe-Danger-Zone-Long-Context". Header names are
+		// case-insensitive, so any conformant server matches it.
+		httpReq.Header.Set(longContextHeader, "true")
+	}
 
 	httpResp, err := c.httpClient.Do(httpReq)
 	if err != nil {
