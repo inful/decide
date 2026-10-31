@@ -37,6 +37,9 @@ type Questions map[string]Question
 
 // Request is the body posted to /v1/systemone.
 type Request struct {
+	// Model names the checkpoint that should answer. Leave it empty to let
+	// the server pick one. The client's WithModel option sets the default.
+	Model     string    `json:"model,omitempty"`
 	State     State     `json:"state"`
 	Questions Questions `json:"questions"`
 }

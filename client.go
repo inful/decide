@@ -71,6 +71,7 @@ type Client struct {
 	endpoint   string
 	resolveErr error
 	token      string
+	model      string
 	httpClient *http.Client
 	retry      RetryPolicy
 	logger     Logger
@@ -105,6 +106,15 @@ func New(baseURL string, opts ...Option) *Client {
 // WithToken sets the bearer token used in the Authorization header.
 func WithToken(token string) Option {
 	return func(c *Client) { c.token = token }
+}
+
+// WithModel names the checkpoint that should answer, for servers that need
+// one — Ollama, for instance, answers 400 "model is required" without it.
+// Leave it unset for servers that route the request themselves.
+//
+// A Request's own Model field overrides this default.
+func WithModel(model string) Option {
+	return func(c *Client) { c.model = model }
 }
 
 // WithHTTPClient swaps the default *http.Client. Useful for setting custom
@@ -376,6 +386,10 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 	}
 	endpoint := c.endpoint
 
+	// The client's model is the default; a model on the request wins.
+	if req.Model == "" {
+		req.Model = c.model
+	}
 	body, _ := json.Marshal(req)
 
 	// A token with a control character cannot be sent as a header. Catch it
