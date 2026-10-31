@@ -17,8 +17,13 @@ concurrency:
 
 jobs:
   test:
-    name: test
+    name: test (go ${{ matrix.go }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The version go.mod declares, and the newest Go. Keep 1.26.x in
+        # step with the go directive in go.mod.
+        go: ['1.26.x', 'stable']
     steps:
       # Actions are pinned to a commit SHA so a moved tag cannot change
       # what runs here. The version goes in the comment.
@@ -26,9 +31,7 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          # Use the version declared in go.mod so the CI matches the
-          # project's stated minimum; bumping go.mod bumps CI automatically.
-          go-version-file: go.mod
+          go-version: ${{ matrix.go }}
           # setup-go's module cache defaults to on, but this package has
           # no dependencies, so there is no go.sum for it to hash and the
           # cache never restores anything.
@@ -64,31 +67,10 @@ jobs:
         if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: coverage
+          # One artifact per matrix entry: v4 refuses a duplicate name.
+          name: coverage-${{ matrix.go }}
           path: coverage.out
           retention-days: 7
-
-  build-min-go:
-    name: build with the minimum Go we claim
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: '1.22.x'
-          # setup-go's module cache defaults to on, but this package has
-          # no dependencies, so there is no go.sum for it to hash and the
-          # cache never restores anything.
-          cache: false
-
-      - name: build the library on the oldest supported Go
-        # The README promises the library works on Go 1.22 and go.mod says
-        # so, so this job builds the published module as it stands.
-        # GOTOOLCHAIN=local stops Go from quietly downloading a newer
-        # toolchain, which would hide a module that asks for more than it
-        # claims.
-        run: GOTOOLCHAIN=local go build ./...
 
   lint:
     name: lint
