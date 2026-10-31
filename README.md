@@ -153,6 +153,33 @@ host, which is too few for a client that talks to a single endpoint.
 Pass your own `*http.Client` with `WithHTTPClient` if you need different
 pool, proxy, or timeout settings.
 
+## Running against a local model
+
+Ollama serves the same `/v1/systemone` endpoint, so this client talks to it
+directly. Ollama requires a `model` in the body; the hosted APIs let the
+server route the request instead.
+
+```bash
+ollama pull laya
+```
+
+```go
+client := decide.New("http://localhost:11434",
+    decide.WithToken("ollama-ignores-this"),
+    decide.WithModel("laya"),
+)
+```
+
+A model on the request overrides the client's default:
+
+```go
+resp, err := client.SystemOne(ctx, decide.Request{
+    Model:  "other-checkpoint",
+    State:  decide.State{Body: "I was charged twice."},
+    Questions: decide.Questions{"department": decide.NewChoice("Which team?", opts)},
+})
+```
+
 ## Request IDs
 
 The client generates a UUID v4 per request and sends it as `X-Request-ID`. The
@@ -244,6 +271,7 @@ Response:
 // Construction
 New(baseURL string, opts ...Option) *Client
 WithToken(string) Option
+WithModel(string) Option
 WithHTTPClient(*http.Client) Option
 WithRetries(int) Option
 WithBackoff(initial, max time.Duration) Option
@@ -256,7 +284,7 @@ Question    { Type, Instructions string; Criteria map[string]string }
 NewChoice(instructions string, criteria map[string]string) Question
 NewNoul(instructions string) Question
 Questions   map[string]Question
-Request     { State, Questions }
+Request     { Model, State, Questions }
 
 Response    { Model, Answers map[string]Answer, Usage; RequestID() }
 Answer      { Type, Choice, Probabilities, Noul, Confidence, AnswerConfidence, Action;
