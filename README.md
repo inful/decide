@@ -147,12 +147,13 @@ wrong.
 `RequestID` and `RetryAfter` for logging. `Body` holds the start of the
 response body, up to 4 KiB. `RequestID` is the `X-Request-ID` the client
 sent, so a failure can be correlated with the server's log; it is empty when
-the request never left the client. `RetryAfter` is how long the server asked
-you to wait, from its `Retry-After` header — the client honours it on its
-own retries, and it is there for a caller that turned retries off. Use
-`errors.Is` to tell success from failure — `StatusCode` is the status on the
-wire, so it can be a 2xx on an error when the response arrived but could not
-be read.
+the request never left the client, and it is in the error's message, so
+logging the error with `%v` keeps it. `RetryAfter` is how long the server
+asked you to wait, from its `Retry-After` header — the client's own wait is
+capped at 30 s, but the error keeps the server's number, which is what a
+caller that turned retries off needs. Use `errors.Is` to tell success from
+failure — `StatusCode` is the status on the wire, so it can be a 2xx on an
+error when the response arrived but could not be read.
 
 ## Retries
 

@@ -100,7 +100,7 @@ func TestClient_SystemOne_HappyPath(t *testing.T) {
 		gotReqID       string
 	)
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		gotAuth = r.Header.Get("Authorization")
 		gotContentType = r.Header.Get("Content-Type")
@@ -110,10 +110,9 @@ func TestClient_SystemOne_HappyPath(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Request-ID", "server-echo-id")
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("<TOKEN>"))
+	c := New(base, WithToken("<TOKEN>"))
 	resp, err := c.SystemOne(context.Background(), Request{
 		State: State{Body: "I was charged twice, I want a refund."},
 		Questions: Questions{
@@ -161,14 +160,13 @@ func TestClient_SystemOne_HappyPath(t *testing.T) {
 
 func TestClient_SystemOne_PropagatesRequestIDFromContext(t *testing.T) {
 	var gotReqID string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		gotReqID = r.Header.Get("X-Request-ID")
 		_, _ = w.Write([]byte(`{"model":"x","answers":{},"usage":{}}`))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
 	ctx := WithContextRequestID(context.Background(), "caller-supplied-id")
-	c := New(srv.URL, WithToken("sk"))
+	c := New(base, WithToken("sk"))
 	_, err := c.SystemOne(ctx, Request{State: State{Body: "hi"}})
 	if err != nil {
 		t.Fatalf("SystemOne: %v", err)
@@ -180,13 +178,12 @@ func TestClient_SystemOne_PropagatesRequestIDFromContext(t *testing.T) {
 
 func TestClient_SystemOne_4xxReturnsTypedErrorNoRetry(t *testing.T) {
 	var attempts atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		attempts.Add(1)
 		http.Error(w, `{"error":"bad state"}`, http.StatusBadRequest)
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"), WithRetries(5))
+	c := New(base, WithToken("sk"), WithRetries(5))
 	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 
 	if err == nil {
@@ -205,13 +202,12 @@ func TestClient_SystemOne_413IsABadRequest(t *testing.T) {
 	// sentinel, or errors.Is matches nothing and the caller cannot tell
 	// "shrink your request" from a server fault.
 	var attempts atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		attempts.Add(1)
 		http.Error(w, `{"error":"text and schema must not exceed 64 KiB"}`, http.StatusRequestEntityTooLarge)
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"), WithRetries(5))
+	c := New(base, WithToken("sk"), WithRetries(5))
 	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 
 	if err == nil {
@@ -250,14 +246,13 @@ func TestWithLongContext_Header(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			var got string
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 				got = r.Header.Get(longContextHeader)
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write([]byte(responseFixture))
-			}))
-			t.Cleanup(srv.Close)
+			})
 
-			client := New(srv.URL, append([]Option{WithToken("sk")}, c.opts...)...)
+			client := New(base, append([]Option{WithToken("sk")}, c.opts...)...)
 			if _, err := client.SystemOne(context.Background(), Request{State: State{Body: "hi"}}); err != nil {
 				t.Fatalf("SystemOne: %v", err)
 			}
@@ -273,20 +268,18 @@ func TestClient_SystemOne_RefusesACrossHostRedirect(t *testing.T) {
 	// it to the redirect target, so the client must not follow one that
 	// leaves the host the caller chose.
 	var gotBody string
-	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	other := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		gotBody = string(b)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(other.Close)
+	})
 
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, other.URL+"/v1/systemone", http.StatusTemporaryRedirect)
-	}))
-	t.Cleanup(api.Close)
+	api := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other+"/v1/systemone", http.StatusTemporaryRedirect)
+	})
 
-	c := New(api.URL, WithToken("sk"))
+	c := New(api, WithToken("sk"))
 	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "secret customer text"}})
 
 	if err == nil {
@@ -310,7 +303,7 @@ func TestClient_SystemOne_RefusesACrossHostRedirect(t *testing.T) {
 func TestClient_SystemOne_FollowsASameHostRedirect(t *testing.T) {
 	// A redirect that stays on the same host and port is fine.
 	var hits atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/systemone" {
 			http.Redirect(w, r, "/v2/systemone", http.StatusTemporaryRedirect)
 			return
@@ -318,10 +311,9 @@ func TestClient_SystemOne_FollowsASameHostRedirect(t *testing.T) {
 		hits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"))
+	c := New(base, WithToken("sk"))
 	if _, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}}); err != nil {
 		t.Fatalf("SystemOne: %v", err)
 	}
@@ -334,13 +326,12 @@ func TestClient_SystemOne_ErrorCarriesTheRequestID(t *testing.T) {
 	// The ID is how a caller correlates a failure with the server's log,
 	// so it has to be on the error and not only in the client's log line.
 	var sent string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		sent = r.Header.Get("X-Request-ID")
 		http.Error(w, `{"error":"boom"}`, http.StatusInternalServerError)
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"), WithRetries(0))
+	c := New(base, WithToken("sk"), WithRetries(0))
 	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 
 	if err == nil {
@@ -360,42 +351,51 @@ func TestClient_SystemOne_ErrorCarriesTheRequestID(t *testing.T) {
 
 func TestClient_SystemOne_ErrorCarriesRetryAfter(t *testing.T) {
 	// A caller that turned retries off still needs to know how long the
-	// server asked it to wait.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Retry-After", "17")
-		http.Error(w, `{"error":"slow down"}`, http.StatusTooManyRequests)
-	}))
-	t.Cleanup(srv.Close)
+	// server asked it to wait. It is the server's own number, not the
+	// client's 30-second cap on how long it waits.
+	for _, tc := range []struct {
+		header string
+		want   time.Duration
+	}{
+		{"17", 17 * time.Second},
+		{"120", 120 * time.Second},
+	} {
+		t.Run(tc.header+"s", func(t *testing.T) {
+			base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Retry-After", tc.header)
+				http.Error(w, `{"error":"slow down"}`, http.StatusTooManyRequests)
+			})
 
-	c := New(srv.URL, WithToken("sk"), WithRetries(0))
-	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
+			c := New(base, WithToken("sk"), WithRetries(0))
+			_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 
-	if err == nil {
-		t.Fatal("expected an error for a 429")
-	}
-	var httpErr *Error
-	if !errors.As(err, &httpErr) {
-		t.Fatalf("expected a *Error, got %T", err)
-	}
-	if httpErr.RetryAfter != 17*time.Second {
-		t.Errorf("RetryAfter = %v, want 17s", httpErr.RetryAfter)
+			if err == nil {
+				t.Fatal("expected an error for a 429")
+			}
+			var httpErr *Error
+			if !errors.As(err, &httpErr) {
+				t.Fatalf("expected a *Error, got %T", err)
+			}
+			if httpErr.RetryAfter != tc.want {
+				t.Errorf("RetryAfter = %v, want %v", httpErr.RetryAfter, tc.want)
+			}
+		})
 	}
 }
 
 func TestClient_SystemOne_529IsRetried(t *testing.T) {
 	// 529 is the API's own overload status, as transient as a 503.
 	var attempts atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if attempts.Add(1) < 3 {
 			http.Error(w, `{"error":"overloaded"}`, 529)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"), WithRetries(3), WithBackoff(time.Millisecond, time.Millisecond))
+	c := New(base, WithToken("sk"), WithRetries(3), WithBackoff(time.Millisecond, time.Millisecond))
 	if _, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}}); err != nil {
 		t.Fatalf("SystemOne: %v", err)
 	}
@@ -425,9 +425,44 @@ func TestClient_InvalidBaseURLReturnsTypedError(t *testing.T) {
 	}
 }
 
+func TestClient_SystemOne_CancelledWaitCarriesTheRequestID(t *testing.T) {
+	// The wait between attempts can be cancelled, and a request has
+	// already gone out: the caller still needs the ID to correlate it.
+	var sent string
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		sent = r.Header.Get("X-Request-ID")
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, `{"error":"rate limited"}`, http.StatusTooManyRequests)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	c := New(base, WithToken("sk"), WithRetries(3))
+	_, err := c.SystemOne(ctx, Request{State: State{Body: "hi"}})
+
+	if err == nil {
+		t.Fatal("expected an error when the context is cancelled")
+	}
+	var httpErr *Error
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("expected a *Error, got %T", err)
+	}
+	if httpErr.RequestID == "" {
+		t.Fatal("the cancelled error carries no request ID")
+	}
+	if httpErr.RequestID != sent {
+		t.Errorf("error RequestID = %q, want the ID that was sent %q", httpErr.RequestID, sent)
+	}
+}
+
 func TestClient_SystemOne_429Then200RetriesThenSucceeds(t *testing.T) {
 	var attempts atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		n := attempts.Add(1)
 		if n < 3 {
 			w.Header().Set("Retry-After", "0")
@@ -435,10 +470,9 @@ func TestClient_SystemOne_429Then200RetriesThenSucceeds(t *testing.T) {
 			return
 		}
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"), WithRetries(5))
+	c := New(base, WithToken("sk"), WithRetries(5))
 	resp, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 	if err != nil {
 		t.Fatalf("SystemOne: %v", err)
@@ -453,13 +487,12 @@ func TestClient_SystemOne_429Then200RetriesThenSucceeds(t *testing.T) {
 
 func TestClient_SystemOne_5xxExhaustsRetriesAndFails(t *testing.T) {
 	var attempts atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		attempts.Add(1)
 		http.Error(w, "boom", http.StatusInternalServerError)
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"), WithRetries(2))
+	c := New(base, WithToken("sk"), WithRetries(2))
 	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 
 	if err == nil {
@@ -474,12 +507,11 @@ func TestClient_SystemOne_5xxExhaustsRetriesAndFails(t *testing.T) {
 }
 
 func TestClient_SystemOne_ContextCancellationStopsRetries(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"), WithRetries(5), WithBackoff(10*time.Millisecond, 50*time.Millisecond))
+	c := New(base, WithToken("sk"), WithRetries(5), WithBackoff(10*time.Millisecond, 50*time.Millisecond))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // pre-cancel so the first attempt sees a cancelled context
@@ -494,13 +526,12 @@ func TestClient_SystemOne_ContextCancellationStopsRetries(t *testing.T) {
 }
 
 func TestClient_SystemOne_LoggerObservesRetries(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "transient", http.StatusServiceUnavailable)
-	}))
-	t.Cleanup(srv.Close)
+	})
 
 	var buf bytes.Buffer
-	c := New(srv.URL,
+	c := New(base,
 		WithToken("sk"),
 		WithRetries(2),
 		WithBackoff(1*time.Millisecond, 5*time.Millisecond),
@@ -519,12 +550,11 @@ func TestClient_SystemOne_LoggerObservesRetries(t *testing.T) {
 
 func TestClient_SystemOne_NilLoggerIsAllowed(t *testing.T) {
 	// WithLogger(nil) means "use the discard logger"; the call must not panic.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"), WithLogger(nil))
+	c := New(base, WithToken("sk"), WithLogger(nil))
 	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 	if err != nil {
 		t.Fatalf("SystemOne: %v", err)
@@ -533,13 +563,12 @@ func TestClient_SystemOne_NilLoggerIsAllowed(t *testing.T) {
 
 func TestClient_AppendsV1SystemOnePath(t *testing.T) {
 	var gotPath string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL+"/", WithToken("sk"))
+	c := New(base+"/", WithToken("sk"))
 	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 	if err != nil {
 		t.Fatalf("SystemOne: %v", err)
@@ -554,13 +583,12 @@ func TestClient_SystemOne_InvalidTokenFailsFast(t *testing.T) {
 	// say so instead of failing every attempt as a transport error.
 	// A trailing newline is the classic source: os.Getenv does not strip it.
 	var attempts atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		attempts.Add(1)
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk-live-abc\n"))
+	c := New(base, WithToken("sk-live-abc\n"))
 	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 
 	if err == nil {
@@ -585,12 +613,11 @@ func TestClient_SystemOne_InvalidTokenFailsFast(t *testing.T) {
 }
 
 func TestClient_SystemOne_NilContextIsSupported(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"))
+	c := New(base, WithToken("sk"))
 	//nolint:staticcheck // deliberately exercising the nil-context support
 	resp, err := c.SystemOne(nil, Request{State: State{Body: "hi"}})
 	if err != nil {
@@ -604,7 +631,7 @@ func TestClient_SystemOne_NilContextIsSupported(t *testing.T) {
 func TestClient_SystemOne_ErrorBodyReadFailureIsReported(t *testing.T) {
 	// If the connection drops part way through the error body, the caller
 	// must be able to tell that the body is incomplete.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte("partial"))
@@ -619,10 +646,9 @@ func TestClient_SystemOne_ErrorBodyReadFailureIsReported(t *testing.T) {
 			return
 		}
 		_ = conn.Close()
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"), WithRetries(0))
+	c := New(base, WithToken("sk"), WithRetries(0))
 	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 	if err == nil {
 		t.Fatal("expected an error")
@@ -640,14 +666,13 @@ func TestWithModel_SendsModelInTheBody(t *testing.T) {
 	// Ollama requires a "model" field; the hosted APIs let the server route
 	// and take no model at all.
 	var got map[string]any
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &got)
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"), WithModel("laya"))
+	c := New(base, WithToken("sk"), WithModel("laya"))
 	if _, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}}); err != nil {
 		t.Fatalf("SystemOne: %v", err)
 	}
@@ -658,14 +683,13 @@ func TestWithModel_SendsModelInTheBody(t *testing.T) {
 
 func TestWithModel_NotSentWhenUnset(t *testing.T) {
 	var got map[string]any
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &got)
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"))
+	c := New(base, WithToken("sk"))
 	if _, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}}); err != nil {
 		t.Fatalf("SystemOne: %v", err)
 	}
@@ -676,14 +700,13 @@ func TestWithModel_NotSentWhenUnset(t *testing.T) {
 
 func TestRequest_ModelOverridesTheClientDefault(t *testing.T) {
 	var got map[string]any
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &got)
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"), WithModel("laya"))
+	c := New(base, WithToken("sk"), WithModel("laya"))
 	_, err := c.SystemOne(context.Background(), Request{
 		Model:     "other-checkpoint",
 		State:     State{Body: "hi"},
@@ -731,14 +754,13 @@ func TestClient_SystemOne_InvalidRequestIDFailsFast(t *testing.T) {
 	// A request ID with a newline cannot be sent as a header. The client
 	// must say so instead of failing every attempt as a transport error.
 	var attempts atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		attempts.Add(1)
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
 	ctx := WithContextRequestID(context.Background(), "bad\nvalue")
-	c := New(srv.URL, WithToken("sk"))
+	c := New(base, WithToken("sk"))
 	_, err := c.SystemOne(ctx, Request{State: State{Body: "hi"}})
 
 	if err == nil {
@@ -763,13 +785,12 @@ func TestClient_SystemOne_InvalidRequestIDFailsFast(t *testing.T) {
 }
 
 func TestClient_SystemOne_LargeErrorBodyIsTrimmed(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(strings.Repeat("x", 512<<10))) // 512 KiB
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"), WithRetries(0))
+	c := New(base, WithToken("sk"), WithRetries(0))
 	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 	e, ok := err.(*Error)
 	if !ok {
@@ -797,12 +818,11 @@ func TestWithRetries_NegativeKeepsTheDefault(t *testing.T) {
 func TestClient_SystemOne_RequestIDFallsBackToSentID(t *testing.T) {
 	// The server does not echo X-Request-ID. The response must still carry
 	// the ID the client sent, so the caller can always correlate.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"), WithRequestIDFunc(func() string { return "sent-id" }))
+	c := New(base, WithToken("sk"), WithRequestIDFunc(func() string { return "sent-id" }))
 	resp, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 	if err != nil {
 		t.Fatalf("SystemOne: %v", err)
@@ -813,13 +833,12 @@ func TestClient_SystemOne_RequestIDFallsBackToSentID(t *testing.T) {
 }
 
 func TestClient_SystemOne_RequestIDFallsBackToContextID(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
 	ctx := WithContextRequestID(context.Background(), "upstream-id")
-	c := New(srv.URL, WithToken("sk"))
+	c := New(base, WithToken("sk"))
 	resp, err := c.SystemOne(ctx, Request{State: State{Body: "hi"}})
 	if err != nil {
 		t.Fatalf("SystemOne: %v", err)
@@ -831,18 +850,17 @@ func TestClient_SystemOne_RequestIDFallsBackToContextID(t *testing.T) {
 
 func TestClient_SystemOne_HonorsRetryAfter(t *testing.T) {
 	var attempts atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if attempts.Add(1) == 1 {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "rate limited", http.StatusTooManyRequests)
 			return
 		}
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
 	var buf bytes.Buffer
-	c := New(srv.URL, WithToken("sk"), WithRetries(3),
+	c := New(base, WithToken("sk"), WithRetries(3),
 		WithBackoff(1*time.Millisecond, 5*time.Millisecond),
 		WithLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))),
 	)
@@ -868,13 +886,12 @@ func TestNew_TypedNilLoggerIsIgnored(t *testing.T) {
 	// A nil *slog.Logger stored in a Logger interface is not a nil
 	// interface; calling it would panic. The client must fall back to the
 	// discard logger instead.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(responseFixture))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
 	var lg *slog.Logger
-	c := New(srv.URL, WithToken("sk"), WithLogger(lg))
+	c := New(base, WithToken("sk"), WithLogger(lg))
 	if _, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}}); err != nil {
 		t.Fatalf("SystemOne: %v", err)
 	}
@@ -918,18 +935,18 @@ func TestDefaultTransportReusesConnections(t *testing.T) {
 	}
 
 	var opened atomic.Int32
-	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	pool := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(responseFixture))
 	}))
-	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+	pool.Config.ConnState = func(_ net.Conn, s http.ConnState) {
 		if s == http.StateNew {
 			opened.Add(1)
 		}
 	}
-	srv.Start()
-	t.Cleanup(srv.Close)
+	pool.Start()
+	t.Cleanup(pool.Close)
 
-	c := New(srv.URL, WithToken("sk"))
+	c := New(pool.URL, WithToken("sk"))
 
 	burst := func() {
 		var wg sync.WaitGroup

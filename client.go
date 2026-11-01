@@ -351,15 +351,22 @@ func (c *Client) runWithRetry(
 			case <-timer.C:
 			case <-ctx.Done():
 				timer.Stop()
+				// A request may already have gone out, so the caller still
+				// needs the ID to correlate it.
+				cancelled := wrapTransportError(http.MethodPost, endpoint, ctx.Err())
+				cancelled.RequestID = requestID
 				return attemptResult{
 					Outcome: outcomeFatal,
-					Err:     wrapTransportError(http.MethodPost, endpoint, ctx.Err()),
+					Err:     cancelled,
 				}
 			}
 		}
 
 		res := action()
-		wait = res.RetryAfter
+		// The server's Retry-After is honoured, but capped so one request
+		// can never pin a goroutine for minutes. The error the caller sees
+		// keeps the server's own number.
+		wait = waitDelay(res.RetryAfter)
 		switch res.Outcome {
 		case outcomeSuccess:
 			return res
@@ -400,14 +407,12 @@ func (c *Client) runWithRetry(
 		// surface a sentinel error rather than panicking.
 		return attemptResult{
 			Outcome: outcomeFatal,
-			Err: &Error{
-				StatusCode: 0,
-				Status:     "no attempts made",
-				Method:     http.MethodPost,
-				URL:        endpoint,
-				Body:       "decide: retry policy yielded zero attempts",
-				sentinel:   ErrTransport,
-			},
+			Err: newLocalError(
+				"no attempts made",
+				endpoint,
+				"decide: retry policy yielded zero attempts",
+				ErrTransport,
+			),
 		}
 	}
 	return last
@@ -423,14 +428,12 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 	if c.resolveErr != nil {
 		// The base URL is the caller's mistake, so report it the way every
 		// other caller error is reported: as an *Error with a sentinel.
-		return nil, &Error{
-			StatusCode: 0,
-			Status:     "invalid base URL",
-			Method:     http.MethodPost,
-			URL:        c.baseURL,
-			Body:       c.resolveErr.Error(),
-			sentinel:   ErrBadRequest,
-		}
+		return nil, newLocalError(
+			"invalid base URL",
+			c.baseURL,
+			c.resolveErr.Error(),
+			ErrBadRequest,
+		)
 	}
 	endpoint := c.endpoint
 
@@ -444,14 +447,12 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 	// here, with a message that names the cause, instead of letting the
 	// HTTP transport fail every attempt.
 	if c.token != "" && !validHeaderValue(c.token) {
-		return nil, &Error{
-			StatusCode: 0,
-			Status:     "invalid token",
-			Method:     http.MethodPost,
-			URL:        endpoint,
-			Body:       "the token contains a character that cannot be sent in an HTTP header",
-			sentinel:   ErrBadRequest,
-		}
+		return nil, newLocalError(
+			"invalid token",
+			endpoint,
+			"the token contains a character that cannot be sent in an HTTP header",
+			ErrBadRequest,
+		)
 	}
 
 	requestID := RequestIDFromContext(ctx)
@@ -462,14 +463,12 @@ func (c *Client) SystemOne(ctx context.Context, req Request) (*Response, error) 
 	// either. Catch it here, with a message that names the cause, instead
 	// of letting the HTTP transport fail every attempt.
 	if !validHeaderValue(requestID) {
-		return nil, &Error{
-			StatusCode: 0,
-			Status:     "invalid request ID",
-			Method:     http.MethodPost,
-			URL:        endpoint,
-			Body:       "the request ID contains a character that cannot be sent in an HTTP header",
-			sentinel:   ErrBadRequest,
-		}
+		return nil, newLocalError(
+			"invalid request ID",
+			endpoint,
+			"the request ID contains a character that cannot be sent in an HTTP header",
+			ErrBadRequest,
+		)
 	}
 
 	c.logger.Debug("systemone: sending request",

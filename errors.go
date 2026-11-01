@@ -57,10 +57,16 @@ type Error struct {
 
 func (e *Error) Error() string {
 	body := truncate(e.Body, 512)
-	if e.StatusCode == 0 {
-		return fmt.Sprintf("decide: %s %s: %s: %s", e.Method, e.URL, e.Status, body)
+	// The request ID goes at the end so the "decide: METHOD URL: ..." part
+	// of the message stays the same for anyone matching on it.
+	id := ""
+	if e.RequestID != "" {
+		id = " (request " + e.RequestID + ")"
 	}
-	return fmt.Sprintf("decide: %s %s: %d %s: %s", e.Method, e.URL, e.StatusCode, e.Status, body)
+	if e.StatusCode == 0 {
+		return fmt.Sprintf("decide: %s %s: %s: %s%s", e.Method, e.URL, e.Status, body, id)
+	}
+	return fmt.Sprintf("decide: %s %s: %d %s: %s%s", e.Method, e.URL, e.StatusCode, e.Status, body, id)
 }
 
 // Unwrap exposes both the package sentinel and any underlying cause so that
@@ -110,6 +116,19 @@ func (e *Error) IsRetryable() bool {
 		return true
 	}
 	return isRetryableStatus(e.StatusCode)
+}
+
+// newLocalError builds an Error for a failure that no HTTP response
+// explains: the status is a description in words, and the status code is 0.
+func newLocalError(status, url, body string, sentinel error) *Error {
+	return &Error{
+		StatusCode: 0,
+		Status:     status,
+		Method:     http.MethodPost,
+		URL:        url,
+		Body:       body,
+		sentinel:   sentinel,
+	}
 }
 
 // newHTTPError wraps an HTTP response with the request context.

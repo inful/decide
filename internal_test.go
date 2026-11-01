@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,12 +18,11 @@ import (
 func TestDecodeResponse_LongMalformedBodyIsReported(t *testing.T) {
 	// A body that does not parse and is longer than the 512 bytes kept for
 	// the message still reports the decode failure, with the raw prefix.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(strings.Repeat("not json ", 200)))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"))
+	c := New(base, WithToken("sk"))
 	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 	if err == nil {
 		t.Fatal("expected a decode error")
@@ -44,16 +44,15 @@ func TestDecodeResponse_BodyReadFailureIsReported(t *testing.T) {
 	// connection, so reading the body fails after the response arrived.
 	// The headers are flushed first, or the server would discard them
 	// with the body and the failure would happen before the response.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "4096")
 		w.WriteHeader(http.StatusOK)
 		w.(http.Flusher).Flush()
 		_, _ = w.Write([]byte(`{"model":"m"`))
 		panic(http.ErrAbortHandler)
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"), WithRetries(0))
+	c := New(base, WithToken("sk"), WithRetries(0))
 	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 	if err == nil {
 		t.Fatal("expected an error when the body cannot be read")
@@ -102,12 +101,32 @@ func TestParseRetryAfter(t *testing.T) {
 		{"not-a-number", 0},
 		{"3", 3 * time.Second},
 		{" 5 ", 5 * time.Second},
-		{"99999", maxRetryAfter},               // clamped so one request cannot block for hours
-		{"9223372036854775807", maxRetryAfter}, // must not overflow
+		{"99999", 99999 * time.Second}, // the server's own number
+		{"9223372036854775807", time.Duration(math.MaxInt64)}, // must not overflow
 	}
 	for _, tc := range cases {
 		if got := parseRetryAfter(tc.in); got != tc.want {
 			t.Errorf("parseRetryAfter(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestWaitDelayCapsTheServersWait(t *testing.T) {
+	// The client honors Retry-After, but not for longer than 30 seconds:
+	// one request must never pin a goroutine for minutes.
+	cases := []struct {
+		in   time.Duration
+		want time.Duration
+	}{
+		{0, 0},
+		{5 * time.Second, 5 * time.Second},
+		{30 * time.Second, 30 * time.Second},
+		{31 * time.Second, maxRetryAfter},
+		{120 * time.Second, maxRetryAfter},
+	}
+	for _, tc := range cases {
+		if got := waitDelay(tc.in); got != tc.want {
+			t.Errorf("waitDelay(%v) = %v, want %v", tc.in, got, tc.want)
 		}
 	}
 }
@@ -124,11 +143,10 @@ func TestParseRetryAfter_HTTPDate(t *testing.T) {
 		t.Errorf("parseRetryAfter(%q) = %v, want 0", past, got)
 	}
 
-	// A date far in the future is clamped, so one request cannot pin a
-	// goroutine for minutes.
+	// The date is what the server asked for; the client caps its own wait.
 	far := time.Now().Add(2 * time.Hour).UTC().Format(http.TimeFormat)
-	if got := parseRetryAfter(far); got != maxRetryAfter {
-		t.Errorf("parseRetryAfter(%q) = %v, want the %v clamp", far, got, maxRetryAfter)
+	if got := parseRetryAfter(far); got < 119*time.Minute || got > 2*time.Hour {
+		t.Errorf("parseRetryAfter(%q) = %v, want about 2h", far, got)
 	}
 }
 
@@ -174,7 +192,7 @@ func TestWithContextRequestID_EmptyIDIsIgnored(t *testing.T) {
 }
 
 func TestDecodeResponse_TooLargeBodyReturnsDistinctError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"model":"m","answers":{},"usage":{},"pad":"`))
 		chunk := strings.Repeat("x", 64<<10)
@@ -182,10 +200,9 @@ func TestDecodeResponse_TooLargeBodyReturnsDistinctError(t *testing.T) {
 			_, _ = w.Write([]byte(chunk))
 		}
 		_, _ = w.Write([]byte(`"}`))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"))
+	c := New(base, WithToken("sk"))
 	_, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 	if err == nil {
 		t.Fatal("expected an error for an oversized response")
@@ -238,12 +255,11 @@ func TestResolve_RejectsEmptyAndInvalidBaseURL(t *testing.T) {
 }
 
 func TestDecodeResponse_MalformedJSONReturnsTypedError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("{this is not json"))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"))
+	c := New(base, WithToken("sk"))
 	_, decErr := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 	if decErr == nil {
 		t.Fatal("expected error from malformed body")
@@ -254,13 +270,12 @@ func TestDecodeResponse_MalformedJSONReturnsTypedError(t *testing.T) {
 }
 
 func TestDecodeResponse_CapturesRequestIDFromResponseHeader(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Request-ID", "echo-this-back")
 		_, _ = w.Write([]byte(`{"model":"m","answers":{},"usage":{}}`))
-	}))
-	t.Cleanup(srv.Close)
+	})
 
-	c := New(srv.URL, WithToken("sk"))
+	c := New(base, WithToken("sk"))
 	resp, err := c.SystemOne(context.Background(), Request{State: State{Body: "hi"}})
 	if err != nil {
 		t.Fatalf("SystemOne: %v", err)
@@ -363,6 +378,17 @@ const (
 	retryTestEndpoint  = "https://example.test/v1/systemone"
 )
 
+// testServer starts an HTTP test server and returns its URL. The server is
+// closed when the test ends.
+func testServer(t *testing.T, h http.HandlerFunc) string {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// retryTestClient returns a Client pointed at nothing, for the tests that
+// drive runWithRetry directly.
 func retryTestClient(t *testing.T) *Client {
 	t.Helper()
 	c := New("https://example.test",
