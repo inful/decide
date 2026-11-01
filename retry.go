@@ -74,39 +74,45 @@ func isRetryableStatus(code int) bool {
 	return false
 }
 
+// waitDelay is how long to wait before the next attempt. It caps the
+// server's Retry-After so one request can never pin a goroutine for
+// minutes.
+func waitDelay(d time.Duration) time.Duration {
+	if d > maxRetryAfter {
+		return maxRetryAfter
+	}
+	return d
+}
+
 // parseRetryAfter reads a Retry-After header. Servers use either a count of
 // seconds or an HTTP date.
 //
 // Returns 0 when the header is absent, unparseable, or asks for a wait of
-// zero or less — the caller then falls back to the computed backoff. Waits
-// longer than maxRetryAfter are clamped so one request can never pin a
-// goroutine for minutes.
+// zero or less. The value is what the server asked for: the client caps how
+// long it waits, so one request can never pin a goroutine for minutes, but
+// the caller still sees what the server said.
 func parseRetryAfter(v string) time.Duration {
 	v = strings.TrimSpace(v)
 	if v == "" {
 		return 0
 	}
-	var d time.Duration
-	if secs, err := strconv.Atoi(v); err == nil {
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
 		if secs <= 0 {
 			return 0
 		}
-		if secs > int(maxRetryAfter/time.Second) {
-			return maxRetryAfter
+		if secs > math.MaxInt64/int64(time.Second) {
+			// Larger than any duration can hold; report the maximum rather
+			// than overflowing the multiply below.
+			return time.Duration(math.MaxInt64)
 		}
-		d = time.Duration(secs) * time.Second
-	} else if t, err := http.ParseTime(v); err == nil {
-		d = time.Until(t)
-		if d <= 0 {
-			return 0
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
 		}
-	} else {
-		return 0
 	}
-	if d > maxRetryAfter {
-		d = maxRetryAfter
-	}
-	return d
+	return 0
 }
 
 // isContextErr reports whether the error (or anything it wraps) is a context

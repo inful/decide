@@ -22,6 +22,37 @@ func TestErrorError(t *testing.T) {
 	}
 }
 
+func TestErrorError_CarriesTheRequestID(t *testing.T) {
+	// The ID has to be in the message: that is how a caller who logs the
+	// error with %v gets something to quote.
+	err := &Error{
+		StatusCode: 500,
+		Status:     "Internal Server Error",
+		Method:     "POST",
+		URL:        "https://example.test/v1/systemone",
+		Body:       "upstream busy",
+		RequestID:  "1664f54c-bdb4-4c17-887c-a4404e871b9f",
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, err.RequestID) {
+		t.Errorf("the message does not carry the request ID: %q", msg)
+	}
+}
+
+func TestErrorError_WithoutARequestIDIsUnchanged(t *testing.T) {
+	err := &Error{
+		StatusCode: 503,
+		Status:     "Service Unavailable",
+		Method:     "POST",
+		URL:        "https://example.test/v1/systemone",
+		Body:       "upstream busy",
+	}
+	want := `decide: POST https://example.test/v1/systemone: 503 Service Unavailable: upstream busy`
+	if got := err.Error(); got != want {
+		t.Errorf("got %q\nwant %q", got, want)
+	}
+}
+
 func TestErrorError_TruncatesLongBody(t *testing.T) {
 	long := make([]byte, 0, 4096)
 	for i := 0; i < 4096; i++ {
